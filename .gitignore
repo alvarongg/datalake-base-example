@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+infra/cdk.out
+infra/cdk-outputs.json
+node_modules
+web/dist
+web/public/config.json
+.DS_Store
