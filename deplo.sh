@@ -9,7 +9,13 @@
 # Uso:
 #   ./deplo.sh              Despliega todo (equivale a "deploy")
 #   ./deplo.sh seed         Sube los CSV de sample-data/ al bucket landing
-#   ./deplo.sh run          Ejecuta el pipeline y espera el resultado
+#   ./deplo.sh run [dataset] [modo]
+#                           Procesa archivos y espera el resultado. Sin argumentos procesa TODOS
+#                           en orden de dependencias. Con dataset: modo "single" (default; falla si
+#                           una dependencia no está al día) o "with_dependencies" (en orden).
+#                           Ej.: ./deplo.sh run products               -> falla sin product_subcategories
+#                                ./deplo.sh run products with_dependencies
+#   ./deplo.sh gold         Construye los modelos Gold (exige Silver al día) y espera
 #   ./deplo.sh reset        Vacía bronze/silver/gold + tablas (conserva los CSV)
 #   ./deplo.sh reset-all    Igual que reset pero también vacía landing
 #   ./deplo.sh destroy      Elimina TODA la infraestructura (cdk destroy)
@@ -181,19 +187,36 @@ cmd_seed() {
     --exclude "*" --include "*.csv" --content-type "text/csv"
 }
 
-cmd_run() {
-  check_prereqs
-  local arn exec status
-  arn="$(output "$S_PIPE" StateMachineArn)"
-  exec="$(aws stepfunctions start-execution --state-machine-arn "$arn" --query executionArn --output text)"
-  log "Pipeline iniciado: $exec"
+# Inicia una ejecución de Step Functions y espera a que termine. Devuelve 1 si no fue SUCCEEDED.
+wait_execution() {  # uso: wait_execution <state-machine-arn> <json-input>
+  local exec status
+  exec="$(aws stepfunctions start-execution --state-machine-arn "$1" --input "$2" --query executionArn --output text)"
+  log "Ejecución iniciada: $exec"
   while true; do
     status="$(aws stepfunctions describe-execution --execution-arn "$exec" --query status --output text)"
     echo "  estado: $status"
     [ "$status" = "RUNNING" ] || break
     sleep 10
   done
-  [ "$status" = "SUCCEEDED" ] || fail "El pipeline terminó en $status"
+  if [ "$status" != "SUCCEEDED" ]; then
+    # Muestra el motivo (p. ej. "products no se puede procesar: product_subcategories nunca se procesó")
+    aws stepfunctions get-execution-history --execution-arn "$exec" --reverse-order --max-items 20 \
+      --query "events[?contains(type,'Failed')].[executionFailedEventDetails.cause,lambdaFunctionFailedEventDetails.cause]" \
+      --output text | grep -v '^None' | head -3 || true
+    return 1
+  fi
+}
+
+cmd_run() {  # uso: run [dataset|all] [single|with_dependencies]
+  check_prereqs
+  local input
+  input="$("$VENV/bin/python" scripts/plan_input.py "${1:-all}" "${2:-single}")" || fail "Argumentos inválidos"
+  wait_execution "$(output "$S_PIPE" DatasetStateMachineArn)" "$input" || fail "El pipeline de datasets terminó con error"
+}
+
+cmd_gold() {
+  check_prereqs
+  wait_execution "$(output "$S_PIPE" GoldStateMachineArn)" '{"models": []}' || fail "El pipeline Gold terminó con error"
 }
 
 cmd_reset() {  # $1 = true|false (incluir landing)
@@ -224,13 +247,14 @@ cmd_deploy() {
   log "Listo ✔"
   echo "Web : $(output "$S_WEB" WebUrl)"
   echo "API : $(output "$S_API" ApiUrl)"
-  echo "Siguiente paso: ./deplo.sh seed && ./deplo.sh run   (o súbelos desde la web)"
+  echo "Siguiente paso: ./deplo.sh seed && ./deplo.sh run && ./deplo.sh gold   (o súbelos y procésalos desde la web)"
 }
 
 case "${1:-deploy}" in
   deploy)    cmd_deploy ;;
   seed)      cmd_seed ;;
-  run)       cmd_run ;;
+  run)       shift; cmd_run "$@" ;;
+  gold)      cmd_gold ;;
   reset)     cmd_reset false ;;
   reset-all) cmd_reset true ;;
   destroy)   cmd_destroy ;;

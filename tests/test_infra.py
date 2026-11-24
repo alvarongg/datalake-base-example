@@ -44,12 +44,12 @@ def test_glue_job_is_small_and_has_timeout(stacks):
 
 
 def test_state_machine_exists(stacks):
-    Template.from_stack(stacks["pipe"]).resource_count_is("AWS::StepFunctions::StateMachine", 1)
+    Template.from_stack(stacks["pipe"]).resource_count_is("AWS::StepFunctions::StateMachine", 2)
 
 
 def test_every_api_route_requires_jwt(stacks):
     t = Template.from_stack(stacks["api"])
     routes = t.find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 6
+    assert len(routes) == 5
     for r in routes.values():
         assert r["Properties"]["AuthorizationType"] == "JWT"

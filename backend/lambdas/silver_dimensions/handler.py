@@ -1,4 +1,4 @@
-"""CAPA SILVER (escenario 1: pandas) - dimensiones pequeñas en una Lambda.
+"""CAPA SILVER (escenario 1: pandas) - una tabla pequeña por ejecución, en una Lambda.
 
 Silver = datos limpios, tipados y deduplicados, listos para analizar.
 Las tablas chicas (clientes, productos, calendario...) caben de sobra en la
@@ -8,6 +8,7 @@ Las tablas grandes (ventas, devoluciones) se procesan con Spark en Glue
 
 La lógica de limpieza vive en ``common/transforms.py`` (funciones puras
 testeadas). Esta Lambda solo lee Bronze, aplica la función y escribe Silver.
+Corre DESPUÉS de la verificación de dependencias.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import logging
 
 import awswrangler as wr
 
+from common.datasets import DATASETS_BY_NAME
+from common.progress import DatasetProgress
 from common.settings import get_settings
 from common.transforms import SILVER_PANDAS_TRANSFORMS
 
@@ -25,9 +28,13 @@ logger.setLevel(logging.INFO)
 
 def lambda_handler(event, context):
     settings = get_settings()
-    reports = []
+    table = event["dataset"]
+    ds = DATASETS_BY_NAME[table]
+    transform = SILVER_PANDAS_TRANSFORMS[table]  # KeyError si se pide un dataset de Glue
+    progress = DatasetProgress.load(settings.athena_results_bucket, table,
+                                    event.get("executionId"), ds.silver_engine)
 
-    for table, transform in SILVER_PANDAS_TRANSFORMS.items():
+    with progress.stage("silver") as info:
         # Leemos la tabla Bronze directamente desde S3 (Parquet).
         bronze_df = wr.s3.read_parquet(settings.table_uri("bronze", table), dataset=True)
         # Las columnas de auditoría no pasan a Silver como columnas de negocio.
@@ -46,7 +53,7 @@ def lambda_handler(event, context):
             compression="snappy",
             glue_table_settings={"description": f"SILVER {table}: limpio y tipado (pandas)."},
         )
-        logger.info("silver.%s: %s -> %s filas", table, report.rows_in, report.rows_out)
-        reports.append(report.as_dict())
+        info.update(rows=report.rows_out, rowsIn=report.rows_in, duplicates=report.duplicates_removed)
 
-    return {"layer": "silver", "engine": "pandas", "tables": reports}
+    logger.info("silver.%s: %s -> %s filas", table, report.rows_in, report.rows_out)
+    return {"layer": "silver", "engine": "pandas", **report.as_dict()}

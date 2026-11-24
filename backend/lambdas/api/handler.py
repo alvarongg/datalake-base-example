@@ -2,12 +2,13 @@
 
 Rutas (todas exigen un token de Cognito, lo valida API Gateway antes de llegar aquí):
 
-  GET  /files                -> qué CSV esperan y cuáles ya están en landing
-  POST /upload-url           -> URL prefirmada para subir UN csv directo a S3
-  POST /pipeline/start       -> inicia el Step Functions
-  GET  /pipeline/status      -> estado por paso (?executionArn=... o el último)
-  POST /reset                -> borra bronze/silver/gold (y landing si se pide)
-  POST /query                -> SELECT de solo lectura en Athena
+  GET  /state             -> estado de cada dataset y modelo Gold (qué está al día,
+                             qué falta, qué se está procesando ahora)
+  POST /upload-url        -> URL prefirmada para subir UN csv directo a S3
+  POST /pipeline/start    -> inicia un pipeline: de un dataset (solo o con sus
+                             dependencias), de todos, o la construcción de Gold
+  POST /reset             -> borra bronze/silver/gold (y landing si se pide)
+  POST /query             -> SELECT de solo lectura en Athena
 
 Los CSV nunca pasan por la API ni por Lambda: el navegador los sube directo a
 S3 con la URL prefirmada. Así no hay límite de 6 MB y no se paga cómputo.
@@ -23,7 +24,12 @@ import time
 import boto3
 from botocore.config import Config
 
-from common.datasets import ALLOWED_FILES, DATASETS
+from common.control import ControlStore
+from common.datasets import (
+    ALLOWED_FILES, DATASETS, DATASETS_BY_NAME, all_in_order, dependency_closure, required_files,
+)
+from common.gold_models import load_models
+from common.progress import PREFIX as PROGRESS_PREFIX
 from common.settings import DATASET_PREFIX, get_settings
 from common.sql_guard import UnsafeSqlError, validate_select
 
@@ -42,18 +48,14 @@ QUERY_TIMEOUT_SECONDS = 22  # API Gateway corta a los 29 s
 
 
 class HttpError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, extra: dict | None = None):
         super().__init__(message)
-        self.status = status
-        self.message = message
+        self.status, self.message, self.extra = status, message, extra or {}
 
 
 def _response(status: int, body: dict):
-    return {
-        "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body, default=str),
-    }
+    return {"statusCode": status, "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(body, default=str)}
 
 
 def _json_body(event) -> dict:
@@ -63,27 +65,125 @@ def _json_body(event) -> dict:
         raise HttpError(400, "El cuerpo debe ser JSON válido.") from exc
 
 
-# ------------------------------------------------------------------ handlers
+# ------------------------------------------------------------ ejecuciones
 
 
-def list_files(event):
-    s = get_settings()
-    present = {}
-    paginator = _s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=s.landing_bucket, Prefix=f"{DATASET_PREFIX}/"):
-        for obj in page.get("Contents", []):
-            present[obj["Key"].split("/", 1)[1]] = obj["Size"]
+def _running(arn: str) -> list[dict]:
+    """Ejecuciones RUNNING (con su input) de una máquina de estados."""
+    out = []
+    for ex in _sfn.list_executions(stateMachineArn=arn, statusFilter="RUNNING", maxResults=10)["executions"]:
+        detail = _sfn.describe_execution(executionArn=ex["executionArn"])
+        out.append({"arn": ex["executionArn"], "input": json.loads(detail.get("input") or "{}")})
+    return out
 
-    datasets = [
-        {
-            "name": d.name,
-            "description": d.description,
-            "engine": d.silver_engine,
-            "files": [{"name": f, "uploaded": f in present, "size": present.get(f)} for f in d.files],
-        }
-        for d in DATASETS
-    ]
-    return 200, {"datasets": datasets, "ready": all(f in present for d in DATASETS for f in d.files)}
+
+def _execution_outcome(execution_arn: str) -> tuple[str, str | None]:
+    """(estado, causa) de una ejecución; la causa explica por qué falló."""
+    ex = _sfn.describe_execution(executionArn=execution_arn)
+    cause = None
+    if ex["status"] in ("FAILED", "TIMED_OUT", "ABORTED"):
+        for page in _sfn.get_paginator("get_execution_history").paginate(executionArn=execution_arn, reverseOrder=True):
+            for ev in page["events"]:
+                d = next((v for k, v in ev.items() if k.endswith("FailedEventDetails")), None)
+                if d:
+                    cause = d.get("cause") or d.get("error")
+                    break
+            if cause:
+                break
+    return ex["status"], cause
+
+
+# --------------------------------------------------------------- progreso
+
+
+def _read_progress_docs() -> dict[str, dict]:
+    bucket = get_settings().athena_results_bucket
+    docs = {}
+    for name in [d.name for d in DATASETS] + ["gold"]:
+        try:
+            docs[name] = json.loads(_s3.get_object(Bucket=bucket, Key=f"{PROGRESS_PREFIX}/{name}.json")["Body"].read())
+        except _s3.exceptions.NoSuchKey:
+            continue
+        except Exception:  # noqa: BLE001 - el progreso es opcional
+            logger.warning("No se pudo leer el progreso de %s", name, exc_info=True)
+    return docs
+
+
+def _reconcile_dataset_run(doc: dict, outcomes: dict) -> dict:
+    """Si la ejecución terminó pero alguna etapa quedó 'running' (p. ej. timeout), la marca como fallida."""
+    stages = doc["stages"]
+    unfinished = any(s["status"] in ("running", "pending") for s in stages.values())
+    run_status = "RUNNING"
+    if any(s["status"] == "failed" for s in stages.values()):
+        run_status = "FAILED"  # una etapa ya informó su fallo: no hace falta consultar Step Functions
+    elif unfinished:
+        arn = doc["executionId"]
+        if arn not in outcomes:
+            try:
+                outcomes[arn] = _execution_outcome(arn)
+            except Exception:  # noqa: BLE001
+                outcomes[arn] = ("UNKNOWN", None)
+        run_status, cause = outcomes[arn]
+        if run_status != "RUNNING":
+            for s in stages.values():
+                if s["status"] == "running":
+                    s.update(status="failed", error=cause or run_status)
+    else:
+        run_status = "FAILED" if any(s["status"] == "failed" for s in stages.values()) else "SUCCEEDED"
+    return {"executionId": doc.get("executionId"), "runStatus": run_status, "stages": stages,
+            "queued": run_status == "RUNNING" and all(s["status"] == "pending" for s in stages.values())}
+
+
+def get_state(event):
+    settings = get_settings()
+    state = ControlStore(settings, _s3).load()
+    docs = _read_progress_docs()
+    outcomes: dict = {}
+
+    datasets = []
+    for d in DATASETS:
+        ctl = state.controls.get(d.name) or {}
+        doc = docs.get(d.name)
+        run = _reconcile_dataset_run(doc, outcomes) if doc else None
+        if run and run["runStatus"] not in ("RUNNING",) and all(
+                s["status"] == "pending" for s in run["stages"].values()):
+            run = None  # estuvo en cola y la ejecución se cortó: no hay nada que mostrar
+        datasets.append({
+            "name": d.name, "description": d.description, "engine": d.silver_engine,
+            "dependsOn": list(d.depends_on),
+            "files": [{"name": f, "uploaded": f in state.landing, "size": (state.landing.get(f) or {}).get("size")}
+                      for f in d.files],
+            "status": state.statuses[d.name],
+            "rows": {"bronze": (ctl.get("bronze") or {}).get("rows"), "silver": (ctl.get("silver") or {}).get("rows")},
+            "run": run,
+        })
+
+    gold_doc = docs.get("gold")
+    gold_run = {t["name"]: t for t in (gold_doc or {}).get("tables", [])}
+    gold_alive = None
+    if gold_doc and any(t["status"] in ("pending", "running") for t in gold_run.values()):
+        arn = gold_doc["executionId"]
+        try:
+            outcomes[arn] = outcomes.get(arn) or _execution_outcome(arn)
+        except Exception:  # noqa: BLE001
+            outcomes[arn] = ("UNKNOWN", None)
+        gold_alive = outcomes[arn][0] == "RUNNING"
+        if not gold_alive:
+            for t in gold_run.values():
+                if t["status"] == "running":
+                    t.update(status="failed", error=outcomes[arn][1] or outcomes[arn][0])
+    gold = [{"name": m.name, "silverDeps": list(m.silver_deps), "goldDeps": list(m.gold_deps),
+             "status": state.gold_statuses[m.name],
+             "run": ({**gold_run[m.name], "active": gold_alive} if m.name in gold_run and
+                     (gold_alive or gold_run[m.name]["status"] != "pending") else None)}
+            for m in load_models()]
+
+    running = bool(_running(os.environ["DATASET_STATE_MACHINE_ARN"]) or _running(os.environ["GOLD_STATE_MACHINE_ARN"]))
+    return 200, {"datasets": datasets, "gold": gold, "running": running,
+                 "ready": all(f in state.landing for f in ALLOWED_FILES)}
+
+
+# ----------------------------------------------------------------- subida
 
 
 def create_upload_url(event):
@@ -94,85 +194,77 @@ def create_upload_url(event):
     s = get_settings()
     url = _s3.generate_presigned_url(
         "put_object",
-        Params={
-            "Bucket": s.landing_bucket,
-            "Key": f"{DATASET_PREFIX}/{filename}",
-            "ContentType": "text/csv",
-        },
+        Params={"Bucket": s.landing_bucket, "Key": f"{DATASET_PREFIX}/{filename}", "ContentType": "text/csv"},
         ExpiresIn=UPLOAD_URL_TTL_SECONDS,
     )
     return 200, {"url": url, "contentType": "text/csv", "expiresIn": UPLOAD_URL_TTL_SECONDS}
 
 
+# ---------------------------------------------------------------- pipelines
+
+
+def plan_dataset_run(dataset: str, mode: str) -> list[str]:
+    """Qué datasets hay que procesar, en orden. Función pura (testeada)."""
+    if dataset == "all":
+        return all_in_order()
+    if dataset not in DATASETS_BY_NAME:
+        raise HttpError(400, f"Dataset desconocido: '{dataset}'.")
+    if mode == "with_dependencies":
+        return dependency_closure(dataset)  # lo que necesita + él mismo, en orden
+    if mode == "single":
+        return [dataset]
+    raise HttpError(400, "mode debe ser 'single' o 'with_dependencies'.")
+
+
 def start_pipeline(event):
-    arn = os.environ["STATE_MACHINE_ARN"]
-    running = _sfn.list_executions(stateMachineArn=arn, statusFilter="RUNNING", maxResults=1)
-    if running["executions"]:
-        raise HttpError(409, "Ya hay un pipeline en ejecución. Espera a que termine.")
-    result = _sfn.start_execution(stateMachineArn=arn)
-    return 202, {"executionArn": result["executionArn"]}
+    body = _json_body(event)
+    kind = body.get("kind", "datasets")
+    ds_arn, gold_arn = os.environ["DATASET_STATE_MACHINE_ARN"], os.environ["GOLD_STATE_MACHINE_ARN"]
+    busy_datasets = {i["dataset"] for r in _running(ds_arn) for i in r["input"].get("datasets", [])}
+    gold_busy = bool(_running(gold_arn))
 
+    if kind == "gold":
+        models = body.get("models") or []
+        known = {m.name for m in load_models()}
+        if any(m not in known for m in models):
+            raise HttpError(400, "Modelo Gold desconocido.")
+        if busy_datasets or gold_busy:
+            raise HttpError(409, "Hay pipelines en ejecución. Gold se construye cuando terminan.")
+        result = _sfn.start_execution(stateMachineArn=gold_arn, input=json.dumps({"models": models}))
+        return 202, {"executionArn": result["executionArn"], "models": models or sorted(known)}
 
-def pipeline_status(event):
-    arn = os.environ["STATE_MACHINE_ARN"]
-    params = event.get("queryStringParameters") or {}
-    execution_arn = params.get("executionArn")
-    if not execution_arn:  # por defecto: la ejecución más reciente
-        latest = _sfn.list_executions(stateMachineArn=arn, maxResults=1)["executions"]
-        if not latest:
-            return 200, {"status": "NONE", "steps": {}}
-        execution_arn = latest[0]["executionArn"]
-    elif not execution_arn.startswith(arn.replace(":stateMachine:", ":execution:")):
-        raise HttpError(400, "executionArn no pertenece a este pipeline.")
+    names = plan_dataset_run(body.get("dataset", ""), body.get("mode", "single"))
+    if gold_busy:
+        raise HttpError(409, "Se está construyendo Gold. Espera a que termine.")
+    clash = sorted(set(names) & busy_datasets)
+    if clash:
+        raise HttpError(409, f"Ya se está procesando: {', '.join(clash)}.")
 
-    execution = _sfn.describe_execution(executionArn=execution_arn)
-    steps: dict[str, str] = {}
-    error = None
-    history = _sfn.get_paginator("get_execution_history").paginate(
-        executionArn=execution_arn, reverseOrder=False
-    )
-    for page in history:
-        for ev in page["events"]:
-            entered = ev.get("stateEnteredEventDetails")
-            exited = ev.get("stateExitedEventDetails")
-            if entered:
-                steps[entered["name"]] = "RUNNING"
-            if exited:
-                steps[exited["name"]] = "SUCCEEDED"
-            if ev["type"].endswith("Failed") and ev["type"] != "ExecutionFailed":
-                # marca como fallido el último paso en curso
-                for name, st in steps.items():
-                    if st == "RUNNING":
-                        steps[name] = "FAILED"
-                details = next((v for k, v in ev.items() if k.endswith("FailedEventDetails")), {})
-                error = details.get("cause") or details.get("error")
-            if ev["type"] == "ExecutionFailed":
-                details = ev.get("executionFailedEventDetails", {})
-                error = error or details.get("cause") or details.get("error")
+    # El sistema EXIGE que estén todos los archivos de lo que va a procesar.
+    landing = ControlStore(get_settings(), _s3).landing_objects()
+    missing = [f for f in required_files(names) if f not in landing]
+    if missing:
+        raise HttpError(400, "Faltan archivos en landing para procesar: " + ", ".join(missing),
+                        {"missingFiles": missing, "datasets": names})
 
-    body = {
-        "executionArn": execution_arn,
-        "status": execution["status"],
-        "startDate": execution["startDate"],
-        "stopDate": execution.get("stopDate"),
-        "steps": steps,
-        "error": error,
-    }
-    if execution["status"] == "SUCCEEDED":
-        body["output"] = json.loads(execution.get("output") or "{}")
-    return 200, body
+    payload = {"datasets": [{"dataset": n, "engine": DATASETS_BY_NAME[n].silver_engine} for n in names]}
+    result = _sfn.start_execution(stateMachineArn=ds_arn, input=json.dumps(payload))
+    return 202, {"executionArn": result["executionArn"], "datasets": names}
 
 
 def reset_lake(event):
     include_landing = bool(_json_body(event).get("includeLanding", False))
-    result = _lambda.invoke(
-        FunctionName=os.environ["RESET_FUNCTION_NAME"],
-        Payload=json.dumps({"include_landing": include_landing}).encode(),
-    )
+    if _running(os.environ["DATASET_STATE_MACHINE_ARN"]) or _running(os.environ["GOLD_STATE_MACHINE_ARN"]):
+        raise HttpError(409, "Hay pipelines en ejecución. Espera a que terminen para reiniciar.")
+    result = _lambda.invoke(FunctionName=os.environ["RESET_FUNCTION_NAME"],
+                            Payload=json.dumps({"include_landing": include_landing}).encode())
     payload = json.loads(result["Payload"].read())
     if result.get("FunctionError"):
         raise HttpError(500, f"El reset falló: {payload.get('errorMessage', 'error desconocido')}")
     return 200, payload
+
+
+# ----------------------------------------------------------------- consultas
 
 
 def run_query(event):
@@ -183,8 +275,7 @@ def run_query(event):
 
     s = get_settings()
     qid = _athena.start_query_execution(
-        QueryString=sql,
-        WorkGroup=s.athena_workgroup,
+        QueryString=sql, WorkGroup=s.athena_workgroup,
         QueryExecutionContext={"Database": s.gold_db},
     )["QueryExecutionId"]
 
@@ -217,10 +308,9 @@ def run_query(event):
 
 
 ROUTES = {
-    "GET /files": list_files,
+    "GET /state": get_state,
     "POST /upload-url": create_upload_url,
     "POST /pipeline/start": start_pipeline,
-    "GET /pipeline/status": pipeline_status,
     "POST /reset": reset_lake,
     "POST /query": run_query,
 }
@@ -235,7 +325,7 @@ def lambda_handler(event, context):
         status, body = handler(event)
         return _response(status, body)
     except HttpError as exc:
-        return _response(exc.status, {"message": exc.message})
+        return _response(exc.status, {"message": exc.message, **exc.extra})
     except Exception:  # noqa: BLE001 - no filtramos detalles internos al cliente
         logger.exception("Error no controlado en %s", route)
         return _response(500, {"message": "Error interno."})

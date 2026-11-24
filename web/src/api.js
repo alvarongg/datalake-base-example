@@ -17,10 +17,16 @@ async function call(method, path, body) {
   return data;
 }
 
-export const listFiles = () => call('GET', '/files');
-export const startPipeline = () => call('POST', '/pipeline/start');
-export const pipelineStatus = (arn) =>
-  call('GET', `/pipeline/status${arn ? `?executionArn=${encodeURIComponent(arn)}` : ''}`);
+/** Estado de cada dataset y modelo Gold (qué está al día, qué se está procesando). */
+export const getState = () => call('GET', '/state');
+
+/** Procesa un dataset ('single') o ese dataset con todo lo que necesita ('with_dependencies').
+ *  dataset = 'all' procesa todos en orden de dependencias. */
+export const startDatasets = (dataset, mode = 'single') => call('POST', '/pipeline/start', { kind: 'datasets', dataset, mode });
+
+/** Construye modelos Gold; sin lista, todos. */
+export const startGold = (models = []) => call('POST', '/pipeline/start', { kind: 'gold', models });
+
 export const resetLake = (includeLanding) => call('POST', '/reset', { includeLanding });
 export const runQuery = (sql) => call('POST', '/query', { sql });
 

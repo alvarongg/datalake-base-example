@@ -122,27 +122,31 @@ export function createMedallionDiagram() {
   return svg;
 }
 
-// Estado de Step Functions -> nodo del diagrama.
-const STEP_TO_NODE = { Bronze: 'bronze', SilverDimensions: 'silver', SilverFacts: 'silver', Gold: 'gold' };
-const RANK = { FAILED: 3, RUNNING: 2, SUCCEEDED: 1 };
+/** Estado de cada capa a partir de /state: 'running' | 'failed' | 'succeeded' | undefined. */
+export function layerStates(state) {
+  const ds = state.datasets, gold = state.gold;
+  const stageOf = (d, k) => (d.run?.runStatus === 'SUCCEEDED' ? 'succeeded' : d.run?.stages?.[k]?.status);
+  const any = (list, st) => list.some((x) => x === st);
+  const bronzeSt = ds.map((d) => stageOf(d, 'bronze'));
+  const silverSt = ds.flatMap((d) => [stageOf(d, 'dependencies'), stageOf(d, 'silver')]);
+  const goldSt = gold.map((g) => g.run?.status);
 
-export function updateDiagram(diagram, steps = {}, executionStatus) {
-  const state = {};
-  for (const [step, st] of Object.entries(steps)) {
-    const node = STEP_TO_NODE[step];
-    if (!node) continue;
-    // Silver tiene dos ramas: gana el estado más urgente (fallo > en curso > ok).
-    const prev = state[node];
-    state[node] = !prev || RANK[st] > RANK[prev] ? st : prev;
-  }
-  // Una rama terminó pero la otra no: Silver sigue en curso.
-  if (state.silver === 'SUCCEEDED' && (steps.SilverDimensions !== 'SUCCEEDED' || steps.SilverFacts !== 'SUCCEEDED')) {
-    state.silver = 'RUNNING';
-  }
-  if (executionStatus === 'SUCCEEDED') state.athena = 'SUCCEEDED';
+  const pick = (list, allDone) => (any(list, 'failed') || any(list, 'blocked') ? 'failed'
+    : any(list, 'running') ? 'running' : allDone ? 'succeeded' : undefined);
+  const goldOk = gold.every((g) => g.status === 'ok');
+  return {
+    bronze: pick(bronzeSt, ds.every((d) => ['bronze', 'stale', 'ok'].includes(d.status))),
+    silver: pick(silverSt, ds.every((d) => d.status === 'ok')),
+    gold: pick(goldSt, goldOk),
+    athena: goldOk ? 'succeeded' : undefined,
+  };
+}
+
+export function updateDiagram(diagram, state) {
+  const layers = layerStates(state);
   diagram.querySelectorAll('[data-node]').forEach((g) => {
     g.classList.remove('running', 'succeeded', 'failed');
-    const st = state[g.dataset.node];
-    if (st) g.classList.add(st.toLowerCase());
+    const st = layers[g.dataset.node];
+    if (st) g.classList.add(st);
   });
 }

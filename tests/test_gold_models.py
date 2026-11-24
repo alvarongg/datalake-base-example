@@ -2,7 +2,7 @@
 
 import re
 
-from lambdas.gold.handler import list_gold_models
+from common.gold_models import list_gold_models
 
 
 def test_models_render_and_are_ctas():

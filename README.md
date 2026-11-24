@@ -45,12 +45,28 @@ Navegador ─► CloudFront ─► S3 (web estática)
 
 ## La web
 
-Cuatro pestañas:
+Cinco pestañas:
 
-- **Resumen**: diagramas con los [iconos oficiales de AWS](https://aws.amazon.com/architecture/icons/) (`web/src/assets/aws/`): cómo se conecta la app y el flujo medallion, que se ilumina mientras corre el pipeline.
-- **Pipelines**: una ficha por cada pipeline (Bronze, Silver pandas, Silver Glue, Gold) con servicios, pasos, reglas, código clave y resultado de la última ejecución.
+- **Resumen**: diagramas con los [iconos oficiales de AWS](https://aws.amazon.com/architecture/icons/) (`web/src/assets/aws/`): cómo se conecta la app y el flujo medallion, que se ilumina mientras corren los pipelines.
+- **Operar**: carga de CSV y **mapa gráfico de pipelines**: un nodo por tabla con sus dependencias como flechas y el estado en vivo de cada etapa (Bronze → Dependencias → Silver). Cada nodo tiene "Solo este" y "Con dependencias". Debajo, los modelos Gold con su propio grafo. Incluye el reinicio.
+- **Pipelines**: una ficha por etapa (Bronze, Dependencias, Silver pandas, Silver Glue, Gold) con servicios, pasos, reglas, código clave y estado actual.
+- **Dashboard**: ocho paneles, cada uno una consulta Athena sobre Gold con su propio gráfico (barras, líneas, dona, KPI, tabla; el tipo se puede cambiar) y una consulta libre con gráfico.
 - **Modelo de datos**: diagrama entidad-relación original (8 tablas de Kaggle, copo de nieve) y el optimizado (estrella + agregados), con la lista de optimizaciones y un comparador que ejecuta la misma consulta en Athena sobre tres modelos y muestra datos leídos y tiempo.
-- **Operar**: carga de CSV, ejecución del pipeline, consultas y reinicio.
+
+## Un pipeline por archivo, con dependencias
+
+Cada extracción dispara su propio pipeline (Step Functions `datalake-demo-datasets`): `Bronze → CheckDependencies → Silver (pandas o Glue) → RecordSilver`. Las dependencias reflejan las claves foráneas (`backend/common/datasets.py`):
+
+```
+product_categories → product_subcategories → products ─┐
+customers, territories, calendar ──────────────────────┼→ sales
+                                    products, territories, calendar → returns
+```
+
+- **Procesar un archivo solo** (`./deplo.sh run products`): Bronze corre, pero la compuerta falla si una tabla padre no está al día. Mensaje real: `products no se puede procesar: product_subcategories nunca se procesó`.
+- **Procesar con dependencias** (`./deplo.sh run products with_dependencies`): el sistema exige que estén TODOS los CSV necesarios (si no, responde con la lista de faltantes) y los procesa en orden.
+- **"Al día"** significa que Silver se construyó con el archivo actual y con la última versión de cada dependencia. Si se reprocesa una tabla padre (o se sube un archivo distinto), las hijas pasan a **desactualizada** y hay que reprocesarlas. El estado vive en `control/` (bucket de resultados) y la lógica pura está en `backend/common/control.py`.
+- **Gold** (`datalake-demo-gold`) lee del propio SQL de qué tablas depende cada modelo y falla antes de tocar nada si alguna no está al día. Se construye todo o solo un modelo.
 
 Medición real (ingresos por categoría 2016, mismo resultado en los tres): modelo normalizado 56 KB leídos, estrella 42 KB, tabla agregada 0,9 KB.
 
@@ -61,7 +77,10 @@ Todo el paso a paso está en [`deplo.sh`](deplo.sh) (comentado como tutorial). R
 ```bash
 ./deplo.sh              # tests + cdk bootstrap/deploy + build web + publicar + usuario demo
 ./deplo.sh seed         # sube sample-data/*.csv a landing (opcional: también se hace desde la web)
-./deplo.sh run          # ejecuta el pipeline y espera el resultado
+./deplo.sh run          # procesa todos los archivos en orden de dependencias y espera
+./deplo.sh run products # solo un archivo: falla si una dependencia no está al día
+./deplo.sh run products with_dependencies   # ese archivo y todo lo que necesita
+./deplo.sh gold         # construye los modelos Gold (exige Silver al día)
 ./deplo.sh reset        # vacía bronze/silver/gold y tablas (conserva los CSV)
 ./deplo.sh reset-all    # vacía también landing
 ./deplo.sh destroy      # elimina toda la infraestructura
@@ -90,7 +109,7 @@ tests/              pytest: transformaciones, SQL guard, modelos Gold, infraestr
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q    # 31 tests, sin credenciales AWS
+.venv/bin/python -m pytest -q    # 70 tests, sin credenciales AWS
 ```
 
 Cubren las funciones de limpieza con los CSV reales, el validador de SQL, el orden de dependencias de los modelos Gold y propiedades de seguridad de la infraestructura (buckets privados, sin auto-registro en Cognito, todas las rutas con JWT). Los jobs de Glue y las Lambdas se validan de punta a punta con `./deplo.sh run`.

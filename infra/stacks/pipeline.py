@@ -1,10 +1,15 @@
-"""El pipeline medallion: Lambdas + Glue Job + Step Functions.
+"""Los pipelines: Lambdas + Glue Job + dos máquinas de estados de Step Functions.
 
-        ┌────────┐   ┌─────────────────────────────────┐   ┌──────┐
- CSV -> │ BRONZE │ → │ SILVER (en paralelo)            │ → │ GOLD │
-        │ Lambda │   │  · dimensiones: Lambda (pandas) │   │Lambda│
-        │ (wr)   │   │  · hechos: Glue Job (Spark)     │   │(CTAS)│
-        └────────┘   └─────────────────────────────────┘   └──────┘
+PIPELINE DE DATASETS (uno por archivo/tabla; se pueden encadenar en orden)
+
+   Plan ─► Map (un dataset a la vez, en orden de dependencias)
+            │  Bronze ─► CheckDependencies ─► ¿motor? ─┬─► SilverPandas (Lambda) ─┐
+            │             (falla si una tabla padre     └─► SilverGlue (Spark)  ───┴─► RecordSilver
+            │              no está al día)
+
+PIPELINE GOLD (modelos SQL; todos o algunos)
+
+   Gold ─► valida dependencias (Silver al día) ─► CTAS en Athena por modelo
 
 Cada permiso IAM se concede de forma explícita y mínima: ninguna función
 puede tocar una capa que no necesita.
@@ -95,13 +100,23 @@ class PipelineStack(Stack):
             f"arn:aws:lambda:{self.region}:336392948345:layer:AWSSDKPandas-Python312:{PANDAS_LAYER_VERSION}",
         )
 
+        plan_fn = self._function("Plan", "lambdas.plan.handler.lambda_handler", Duration.seconds(30), layer=False)
         bronze_fn = self._function("Bronze", "lambdas.bronze.handler.lambda_handler", Duration.minutes(5))
+        deps_fn = self._function("Dependencies", "lambdas.dependencies.handler.lambda_handler", Duration.seconds(30), layer=False)
         silver_fn = self._function("SilverDimensions", "lambdas.silver_dimensions.handler.lambda_handler", Duration.minutes(5))
+        finalize_fn = self._function("Finalize", "lambdas.finalize.handler.lambda_handler", Duration.seconds(30), layer=False)
         gold_fn = self._function("Gold", "lambdas.gold.handler.lambda_handler", Duration.minutes(10))
         self.reset_fn = self._function("Reset", "lambdas.reset.handler.lambda_handler", Duration.minutes(2), layer=True)
 
         # ---- permisos mínimos por función ---------------------------------
-        lake.landing.grant_read(bronze_fn)
+        # Progreso y control viven en el bucket de resultados, SOLO bajo progress/ y control/.
+        for fn in (plan_fn, bronze_fn, deps_fn, silver_fn, finalize_fn):
+            lake.athena_results.grant_read_write(fn, "progress/*")
+            lake.athena_results.grant_read_write(fn, "control/*")
+        # Las Lambdas que calculan el estado del lake necesitan listar landing (versión de los archivos).
+        for fn in (bronze_fn, deps_fn, gold_fn):
+            lake.landing.grant_read(fn)
+
         lake.bronze.grant_read_write(bronze_fn)
         bronze_fn.add_to_role_policy(glue_policy(self, [lake.bronze_db], GLUE_ACTIONS))
 
@@ -133,6 +148,7 @@ class PipelineStack(Stack):
         script.grant_read(glue_role)
         lake.bronze.grant_read(glue_role)
         lake.silver.grant_read_write(glue_role)
+        lake.athena_results.grant_read_write(glue_role, "progress/*")
         glue_role.add_to_policy(glue_policy(self, [lake.bronze_db], GLUE_READ_ACTIONS))
         glue_role.add_to_policy(glue_policy(self, [lake.silver_db], GLUE_ACTIONS))
 
@@ -145,6 +161,8 @@ class PipelineStack(Stack):
             number_of_workers=2,  # mínimo permitido: el volumen del ejemplo es chico
             timeout=15,           # minutos: evita que un error deje el job corriendo (y cobrando)
             max_retries=0,
+            # sales y returns pueden procesarse al mismo tiempo (una ejecución por dataset).
+            execution_property=glue.CfnJob.ExecutionPropertyProperty(max_concurrent_runs=2),
             command=glue.CfnJob.JobCommandProperty(
                 name="glueetl", python_version="3", script_location=script.s3_object_url
             ),
@@ -152,6 +170,9 @@ class PipelineStack(Stack):
                 "--bronze_database": lake.bronze_db,
                 "--silver_database": lake.silver_db,
                 "--silver_path": f"s3://{lake.silver.bucket_name}/adventureworks",
+                "--progress_bucket": lake.athena_results.bucket_name,
+                "--dataset": "sales",           # Step Functions lo reemplaza por el dataset de la ejecución
+                "--execution_id": "manual",     # ídem con el id de la ejecución
                 "--enable-glue-datacatalog": "true",
                 "--enable-metrics": "true",
                 "--enable-continuous-cloudwatch-log": "true",
@@ -159,45 +180,89 @@ class PipelineStack(Stack):
             },
         )
 
-        # ---- Step Functions ----------------------------------------------
+        # ---- Step Functions: pipeline de DATASETS ------------------------
+        exec_id = sfn.JsonPath.string_at("$$.Execution.Id")  # asocia el progreso a ESTA corrida
+        dataset = sfn.JsonPath.string_at("$.dataset")
+        item_payload = sfn.TaskInput.from_object({"dataset": dataset, "executionId": exec_id})
+
+        plan_step = tasks.LambdaInvoke(
+            self, "Plan", lambda_function=plan_fn, payload_response_only=True,
+            payload=sfn.TaskInput.from_object({"datasets": sfn.JsonPath.list_at("$.datasets"), "executionId": exec_id}),
+            result_path=sfn.JsonPath.DISCARD,
+        )
         bronze_step = tasks.LambdaInvoke(
             self, "Bronze", lambda_function=bronze_fn, payload_response_only=True,
-            result_path="$.bronze",
+            payload=item_payload, result_path="$.bronze",
         )
-        silver_dims = tasks.LambdaInvoke(
-            self, "SilverDimensions", lambda_function=silver_fn, payload_response_only=True,
-            result_path="$.silver_dimensions",
+        deps_step = tasks.LambdaInvoke(
+            self, "CheckDependencies", lambda_function=deps_fn, payload_response_only=True,
+            payload=item_payload, result_path="$.deps",
         )
-        silver_facts = tasks.GlueStartJobRun(
-            self, "SilverFacts", glue_job_name=glue_job.name,
+        silver_pandas = tasks.LambdaInvoke(
+            self, "SilverPandas", lambda_function=silver_fn, payload_response_only=True,
+            payload=item_payload, result_path="$.silver",
+        )
+        silver_glue = tasks.GlueStartJobRun(
+            self, "SilverGlue", glue_job_name=glue_job.name,
             integration_pattern=sfn.IntegrationPattern.RUN_JOB,  # espera a que Glue termine
-            result_selector={"job_run_id.$": "$.Id", "state.$": "$.JobRunState",
-                             "seconds.$": "$.ExecutionTime"},
-            result_path="$.silver_facts",
+            arguments=sfn.TaskInput.from_object({"--dataset": dataset, "--execution_id": exec_id}),
+            result_selector={"job_run_id.$": "$.Id", "state.$": "$.JobRunState", "seconds.$": "$.ExecutionTime"},
+            result_path="$.silver",
         )
-        gold_step = tasks.LambdaInvoke(
-            self, "Gold", lambda_function=gold_fn, payload_response_only=True,
-            result_path="$.gold",
+        record_step = tasks.LambdaInvoke(
+            self, "RecordSilver", lambda_function=finalize_fn, payload_response_only=True,
+            payload=sfn.TaskInput.from_object({
+                "dataset": dataset, "executionId": exec_id,
+                "built_from": sfn.JsonPath.object_at("$.deps.built_from"),
+            }),
+            result_path=sfn.JsonPath.DISCARD,
         )
-        silver_parallel = sfn.Parallel(self, "Silver", result_path="$.silver").branch(silver_dims).branch(silver_facts)
-        # Cada rama escribe en su propio result_path; Parallel devuelve un array.
-        # Lo dejamos en $.silver y descartamos la entrada duplicada.
+        # Según el motor del dataset, Silver se procesa con Glue (Spark) o con pandas (Lambda).
+        by_engine = (sfn.Choice(self, "EngineOfDataset")
+                     .when(sfn.Condition.string_equals("$.engine", "glue"), silver_glue)
+                     .otherwise(silver_pandas)
+                     .afterwards())
+        per_dataset = sfn.Chain.start(bronze_step).next(deps_step).next(by_engine).next(record_step)
 
-        definition = bronze_step.next(silver_parallel).next(gold_step)
+        # Un dataset a la vez y en el orden recibido (ya viene ordenado por dependencias).
+        for_each = sfn.Map(
+            self, "ForEachDataset", items_path="$.datasets", max_concurrency=1,
+            item_selector={"dataset": sfn.JsonPath.string_at("$$.Map.Item.Value.dataset"),
+                           "engine": sfn.JsonPath.string_at("$$.Map.Item.Value.engine")},
+            result_path=sfn.JsonPath.DISCARD,
+        ).item_processor(per_dataset)
 
-        self.state_machine = sfn.StateMachine(
-            self, "Pipeline",
-            state_machine_name="datalake-demo-medallion",
-            definition_body=sfn.DefinitionBody.from_chainable(definition),
+        self.dataset_machine = sfn.StateMachine(
+            self, "DatasetPipeline",
+            state_machine_name="datalake-demo-datasets",
+            definition_body=sfn.DefinitionBody.from_chainable(plan_step.next(for_each)),
             timeout=Duration.hours(1),
             logs=sfn.LogOptions(
-                destination=logs.LogGroup(self, "PipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
+                destination=logs.LogGroup(self, "DatasetPipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
                                           removal_policy=RemovalPolicy.DESTROY),
                 level=sfn.LogLevel.ERROR,
             ),
         )
 
-        CfnOutput(self, "StateMachineArn", value=self.state_machine.state_machine_arn)
+        # ---- Step Functions: pipeline GOLD -------------------------------
+        gold_step = tasks.LambdaInvoke(
+            self, "Gold", lambda_function=gold_fn, payload_response_only=True,
+            payload=sfn.TaskInput.from_object({"models": sfn.JsonPath.list_at("$.models"), "executionId": exec_id}),
+        )
+        self.gold_machine = sfn.StateMachine(
+            self, "GoldPipeline",
+            state_machine_name="datalake-demo-gold",
+            definition_body=sfn.DefinitionBody.from_chainable(gold_step),
+            timeout=Duration.hours(1),
+            logs=sfn.LogOptions(
+                destination=logs.LogGroup(self, "GoldPipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
+                                          removal_policy=RemovalPolicy.DESTROY),
+                level=sfn.LogLevel.ERROR,
+            ),
+        )
+
+        CfnOutput(self, "DatasetStateMachineArn", value=self.dataset_machine.state_machine_arn)
+        CfnOutput(self, "GoldStateMachineArn", value=self.gold_machine.state_machine_arn)
         CfnOutput(self, "ResetFunctionName", value=self.reset_fn.function_name)
 
     def _function(self, name: str, handler: str, timeout: Duration, layer: bool = True) -> _lambda.Function:

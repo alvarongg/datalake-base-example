@@ -26,7 +26,8 @@ class ApiStack(Stack):
             timeout=Duration.seconds(28),  # API Gateway corta a los 29 s
             environment={
                 **pipeline.env_vars,
-                "STATE_MACHINE_ARN": pipeline.state_machine.state_machine_arn,
+                "DATASET_STATE_MACHINE_ARN": pipeline.dataset_machine.state_machine_arn,
+                "GOLD_STATE_MACHINE_ARN": pipeline.gold_machine.state_machine_arn,
                 "RESET_FUNCTION_NAME": pipeline.reset_fn.function_name,
             },
             log_retention=logs.RetentionDays.ONE_WEEK,
@@ -43,15 +44,19 @@ class ApiStack(Stack):
             glue_policy(self, [lake.bronze_db, lake.silver_db, lake.gold_db], GLUE_READ_ACTIONS)
         )
         fn.add_to_role_policy(athena_policy(self, lake.workgroup))
-        pipeline.state_machine.grant_start_execution(fn)
-        pipeline.state_machine.grant_read(fn)
+        machines = (pipeline.dataset_machine, pipeline.gold_machine)
+        for machine in machines:
+            machine.grant_start_execution(fn)
         fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["states:ListExecutions", "states:DescribeExecution", "states:GetExecutionHistory"],
+            actions=["states:ListExecutions"],
+            resources=[m.state_machine_arn for m in machines],
+        ))
+        fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["states:DescribeExecution", "states:GetExecutionHistory"],
             resources=[
-                pipeline.state_machine.state_machine_arn,
-                self.format_arn(service="states", resource="execution",
-                                resource_name=f"{pipeline.state_machine.state_machine_name}:*",
-                                arn_format=ArnFormat.COLON_RESOURCE_NAME),
+                self.format_arn(service="states", resource="execution", resource_name=f"{m.state_machine_name}:*",
+                                arn_format=ArnFormat.COLON_RESOURCE_NAME)
+                for m in machines
             ],
         ))
         pipeline.reset_fn.grant_invoke(fn)
@@ -74,10 +79,9 @@ class ApiStack(Stack):
         )
         integration = HttpLambdaIntegration("RoutesIntegration", fn)
         for method, path in (
-            (apigw.HttpMethod.GET, "/files"),
+            (apigw.HttpMethod.GET, "/state"),
             (apigw.HttpMethod.POST, "/upload-url"),
             (apigw.HttpMethod.POST, "/pipeline/start"),
-            (apigw.HttpMethod.GET, "/pipeline/status"),
             (apigw.HttpMethod.POST, "/reset"),
             (apigw.HttpMethod.POST, "/query"),
         ):
