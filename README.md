@@ -43,6 +43,17 @@ Navegador ─► CloudFront ─► S3 (web estática)
 - **Silver**: tipos reales (fechas, números), textos normalizados, `"$90,000 "` → `90000.0`, `"0"` → `NULL`, duplicados eliminados, claves validadas. Si una clave obligatoria viene nula, el pipeline falla (no se publican datos dudosos).
 - **Gold**: `dim_product`, `dim_customer`, `dim_territory`, `dim_date`, `fact_sales`, `fact_returns` y agregados (`sales_monthly_by_category`, `sales_by_territory`, `return_rate_by_category`, `sales_by_customer_segment`).
 
+## La web
+
+Cuatro pestañas:
+
+- **Resumen**: diagramas con los [iconos oficiales de AWS](https://aws.amazon.com/architecture/icons/) (`web/src/assets/aws/`): cómo se conecta la app y el flujo medallion, que se ilumina mientras corre el pipeline.
+- **Pipelines**: una ficha por cada pipeline (Bronze, Silver pandas, Silver Glue, Gold) con servicios, pasos, reglas, código clave y resultado de la última ejecución.
+- **Modelo de datos**: diagrama entidad-relación original (8 tablas de Kaggle, copo de nieve) y el optimizado (estrella + agregados), con la lista de optimizaciones y un comparador que ejecuta la misma consulta en Athena sobre tres modelos y muestra datos leídos y tiempo.
+- **Operar**: carga de CSV, ejecución del pipeline, consultas y reinicio.
+
+Medición real (ingresos por categoría 2016, mismo resultado en los tres): modelo normalizado 56 KB leídos, estrella 42 KB, tabla agregada 0,9 KB.
+
 ## Despliegue
 
 Todo el paso a paso está en [`deplo.sh`](deplo.sh) (comentado como tutorial). Requiere AWS CLI, Node 20+ y Python 3.12.

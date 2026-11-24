@@ -190,7 +190,8 @@ def run_query(event):
 
     deadline = time.monotonic() + QUERY_TIMEOUT_SECONDS
     while True:
-        status = _athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+        execution = _athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+        status = execution["Status"]
         state = status["State"]
         if state == "SUCCEEDED":
             break
@@ -204,8 +205,15 @@ def run_query(event):
     rows = _athena.get_query_results(QueryExecutionId=qid, MaxResults=MAX_ROWS + 1)
     columns = [c["Label"] for c in rows["ResultSet"]["ResultSetMetadata"]["ColumnInfo"]]
     data = [[v.get("VarCharValue") for v in r["Data"]] for r in rows["ResultSet"]["Rows"][1:]]
-    return 200, {"columns": columns, "rows": data[:MAX_ROWS], "truncated": len(data) > MAX_ROWS,
-                 "queryExecutionId": qid}
+    stats = execution.get("Statistics", {})
+    return 200, {
+        "columns": columns, "rows": data[:MAX_ROWS], "truncated": len(data) > MAX_ROWS,
+        "queryExecutionId": qid,
+        # Métricas que permiten comparar modelos: bytes leídos y tiempo del motor.
+        "stats": {"dataScannedBytes": stats.get("DataScannedInBytes"),
+                  "engineMillis": stats.get("EngineExecutionTimeInMillis"),
+                  "totalMillis": stats.get("TotalExecutionTimeInMillis")},
+    }
 
 
 ROUTES = {
