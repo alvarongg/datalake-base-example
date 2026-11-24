@@ -46,3 +46,27 @@ th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--
 .step small { color: var(--muted); }
 @media (prefers-reduced-motion: no-preference) { .step.running .icon { animation: pulse 1s infinite alternate; } }
 @keyframes pulse { to { opacity: .3; } }
+
+/* Diagrama de capas */
+.diagram-wrap { margin: 1rem 0; overflow-x: auto; }
+.diagram { width: 100%; min-width: 720px; height: auto; }
+.diagram .node rect { fill: var(--bg); stroke: var(--line); stroke-width: 2; transition: stroke .3s, fill .3s; }
+.diagram .node-title { fill: var(--text); font-size: 17px; font-weight: 700; }
+.diagram .node-tool { fill: var(--muted); font-size: 11px; }
+.diagram .node-note { fill: var(--muted); font-size: 12px; }
+.diagram .node-user rect, .diagram .node-athena rect { stroke-dasharray: 5 4; }
+.diagram .node-landing rect { stroke: var(--landing); }
+.diagram .node-bronze rect  { stroke: var(--bronze); }
+.diagram .node-silver rect  { stroke: var(--silver); }
+.diagram .node-gold rect    { stroke: var(--gold); }
+.diagram .node.running rect   { fill: #312e81; stroke: var(--accent); }
+.diagram .node.succeeded rect { fill: #14532d; stroke: var(--ok); }
+.diagram .node.failed rect    { fill: #7f1d1d; stroke: var(--err); }
+.diagram .flow { stroke: var(--muted); stroke-width: 2; stroke-dasharray: 6 5; }
+.diagram .arrow-head { fill: var(--muted); }
+@media (prefers-reduced-motion: no-preference) {
+  .diagram .flow { animation: dash 1s linear infinite; }
+  .diagram .node.running rect { animation: glow 1s ease-in-out infinite alternate; }
+}
+@keyframes dash { to { stroke-dashoffset: -11; } }
+@keyframes glow { to { stroke-width: 4; } }

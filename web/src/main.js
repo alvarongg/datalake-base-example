@@ -2,6 +2,7 @@ import './style.css';
 import { loadConfig, currentIdToken, currentEmail, login, logout } from './auth.js';
 import * as api from './api.js';
 import { LAYERS, STEPS, EXAMPLE_QUERIES } from './content.js';
+import { createDiagram, updateDiagram } from './diagram.js';
 
 /* ---------------------------------------------------------------- helpers
  * `h` crea elementos del DOM. Usamos textContent (nunca innerHTML) para que
@@ -46,10 +47,12 @@ let pollTimer = null;
 async function renderApp() {
   clearInterval(pollTimer);
 
-  // --- Intro: las 4 capas -------------------------------------------------
+  // --- Intro: diagrama y las 4 capas ----------------------------------------
+  const diagram = createDiagram();
   const intro = h('section', { class: 'card' },
     h('h2', {}, 'El modelo medallion en 4 pasos'),
     h('p', { class: 'muted' }, 'Cada capa mejora la calidad del dato. Si algo sale mal, siempre se puede volver a la capa anterior y reprocesar.'),
+    h('div', { class: 'diagram-wrap' }, diagram),
     h('div', { class: 'layers' }, LAYERS.map((l, i) =>
       h('div', { class: `layer layer-${l.id}` },
         h('span', { class: 'badge' }, `${i + 1}`), h('h3', {}, l.title), h('small', {}, l.tag), h('p', {}, l.text)))));
@@ -99,6 +102,7 @@ async function renderApp() {
   } }, '▶ Ejecutar pipeline');
 
   function renderSteps(status) {
+    updateDiagram(diagram, status.steps, status.status);
     const icon = { RUNNING: '⏳', SUCCEEDED: '✔', FAILED: '✖' };
     stepsBox.replaceChildren(...STEPS.map((s) => {
       const st = status.steps?.[s.name];
@@ -150,7 +154,7 @@ async function renderApp() {
     try {
       await api.resetLake(includeLanding);
       resetMsg.textContent = '✔ Lake vacío. Puedes volver a ejecutar el pipeline desde cero.';
-      stepsBox.replaceChildren(); pipeMsg.textContent = '';
+      stepsBox.replaceChildren(); pipeMsg.textContent = ''; updateDiagram(diagram);
       resultBox.replaceChildren();
       await refreshFiles();
     } catch (e) { resetMsg.textContent = `✖ ${e.message}`; }
