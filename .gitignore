@@ -8,3 +8,4 @@ node_modules
 web/dist
 web/public/config.json
 .DS_Store
+web/tsconfig.tsbuildinfo

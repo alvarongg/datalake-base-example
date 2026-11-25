@@ -9,7 +9,19 @@
 # Uso:
 #   ./deplo.sh              Despliega todo (equivale a "deploy")
 #   ./deplo.sh seed         Sube los CSV de sample-data/ al bucket landing
-#   ./deplo.sh run          Ejecuta el pipeline y espera el resultado
+#                           (en modo event-driven, ESO SOLO dispara todo el pipeline)
+#   ./deplo.sh mode [event|scheduled]
+#                           Muestra o cambia el modo: event-driven (S3 → SQS → Lambda)
+#                           o programado (EventBridge cada 30 min → Step Functions)
+#   ./deplo.sh schedule     (modo programado) ejecuta ya el flujo programado y espera
+#   ./deplo.sh run [dataset] [modo]
+#                           Procesa archivos y espera el resultado. Sin argumentos procesa TODOS
+#                           en orden de dependencias. Con dataset: modo "single" (default; falla si
+#                           una dependencia no está al día) o "with_dependencies" (en orden).
+#                           Ej.: ./deplo.sh run products               -> falla sin product_subcategories
+#                                ./deplo.sh run products with_dependencies
+#   ./deplo.sh gold         Construye los modelos Gold (exige Silver al día) y espera
+#                           (run y gold son del modo programado: Step Functions a mano)
 #   ./deplo.sh reset        Vacía bronze/silver/gold + tablas (conserva los CSV)
 #   ./deplo.sh reset-all    Igual que reset pero también vacía landing
 #   ./deplo.sh destroy      Elimina TODA la infraestructura (cdk destroy)
@@ -63,6 +75,9 @@ check_prereqs() {
   for bin in aws node npm python3; do
     command -v "$bin" >/dev/null || fail "Falta '$bin' en el PATH"
   done
+  # La web (React + Vite 7) necesita Node 20.19 o superior; CDK también corre sobre Node.
+  node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>20||(a===20&&b>=19)?0:1)' \
+    || fail "Se necesita Node >= 20.19 (tienes $(node -v)). Instala Node 22 LTS y vuelve a intentar."
   # Si las credenciales no sirven, fallamos ya, antes de construir nada.
   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)" \
     || fail "El perfil '$AWS_PROFILE' no tiene credenciales válidas (prueba 'aws sso login' o 'aws configure')"
@@ -123,8 +138,9 @@ build_web() {
   "apiUrl": "$(output "$S_API" ApiUrl)"
 }
 EOF
-  log "7/9 Compilando la web (npm + vite)"
-  (cd web && npm install --no-audit --no-fund && npm run build)
+  log "7/9 Compilando la web (React + Vite: tipos con tsc y bundle optimizado)"
+  # npm ci instala exactamente lo que dice package-lock.json (builds reproducibles).
+  (cd web && npm ci --no-audit --no-fund && npm run build)
 }
 
 # ---------------------------------------------------------------------------
@@ -181,19 +197,59 @@ cmd_seed() {
     --exclude "*" --include "*.csv" --content-type "text/csv"
 }
 
-cmd_run() {
-  check_prereqs
-  local arn exec status
-  arn="$(output "$S_PIPE" StateMachineArn)"
-  exec="$(aws stepfunctions start-execution --state-machine-arn "$arn" --query executionArn --output text)"
-  log "Pipeline iniciado: $exec"
+# Inicia una ejecución de Step Functions y espera a que termine. Devuelve 1 si no fue SUCCEEDED.
+wait_execution() {  # uso: wait_execution <state-machine-arn> <json-input>
+  local exec status
+  exec="$(aws stepfunctions start-execution --state-machine-arn "$1" --input "$2" --query executionArn --output text)"
+  log "Ejecución iniciada: $exec"
   while true; do
     status="$(aws stepfunctions describe-execution --execution-arn "$exec" --query status --output text)"
     echo "  estado: $status"
     [ "$status" = "RUNNING" ] || break
     sleep 10
   done
-  [ "$status" = "SUCCEEDED" ] || fail "El pipeline terminó en $status"
+  if [ "$status" != "SUCCEEDED" ]; then
+    # Muestra el motivo (p. ej. "products no se puede procesar: product_subcategories nunca se procesó")
+    aws stepfunctions get-execution-history --execution-arn "$exec" --reverse-order --max-items 20 \
+      --query "events[?contains(type,'Failed')].[executionFailedEventDetails.cause,lambdaFunctionFailedEventDetails.cause]" \
+      --output text | grep -v '^None' | head -3 || true
+    return 1
+  fi
+}
+
+MODE_PARAM="/datalake-demo/pipeline-mode"
+current_mode() { aws ssm get-parameter --name "$MODE_PARAM" --query Parameter.Value --output text; }
+require_scheduled() {
+  [ "$(current_mode)" = "scheduled" ] || fail "El modo actual es event-driven: los archivos se procesan solos al llegar. Usa './deplo.sh mode scheduled' para ejecutar Step Functions a mano."
+}
+
+cmd_mode() {
+  check_prereqs
+  if [ -z "${1:-}" ]; then echo "Modo actual: $(current_mode)"; return; fi
+  [ "$1" = "event" ] || [ "$1" = "scheduled" ] || fail "Modo inválido: usa event o scheduled"
+  aws ssm put-parameter --name "$MODE_PARAM" --value "$1" --type String --overwrite >/dev/null
+  echo "Modo cambiado a: $1"
+  [ "$1" = "event" ] && echo "Tip: los archivos que estén en landing no generan evento solos; usa la web (cambiar de modo re-emite sus eventos) o './deplo.sh seed'."
+}
+
+cmd_schedule() {
+  check_prereqs
+  require_scheduled
+  wait_execution "$(output "$S_PIPE" ScheduledStateMachineArn)" '{"manual": true}' || fail "El flujo programado terminó con error"
+}
+
+cmd_run() {  # uso: run [dataset|all] [single|with_dependencies]
+  check_prereqs
+  require_scheduled
+  local input
+  input="$("$VENV/bin/python" scripts/plan_input.py "${1:-all}" "${2:-single}")" || fail "Argumentos inválidos"
+  wait_execution "$(output "$S_PIPE" DatasetStateMachineArn)" "$input" || fail "El pipeline de datasets terminó con error"
+}
+
+cmd_gold() {
+  check_prereqs
+  require_scheduled
+  wait_execution "$(output "$S_PIPE" GoldStateMachineArn)" '{"models": [], "onlyStale": false, "onlyReady": false}' || fail "El pipeline Gold terminó con error"
 }
 
 cmd_reset() {  # $1 = true|false (incluir landing)
@@ -224,13 +280,16 @@ cmd_deploy() {
   log "Listo ✔"
   echo "Web : $(output "$S_WEB" WebUrl)"
   echo "API : $(output "$S_API" ApiUrl)"
-  echo "Siguiente paso: ./deplo.sh seed && ./deplo.sh run   (o súbelos desde la web)"
+  echo "Modo: $(current_mode). Siguiente paso: ./deplo.sh seed (event-driven procesa todo solo) o súbelos desde la web"
 }
 
 case "${1:-deploy}" in
   deploy)    cmd_deploy ;;
   seed)      cmd_seed ;;
-  run)       cmd_run ;;
+  run)       shift; cmd_run "$@" ;;
+  gold)      cmd_gold ;;
+  mode)      shift; cmd_mode "$@" ;;
+  schedule)  cmd_schedule ;;
   reset)     cmd_reset false ;;
   reset-all) cmd_reset true ;;
   destroy)   cmd_destroy ;;

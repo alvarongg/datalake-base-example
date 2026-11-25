@@ -11,9 +11,15 @@ Salida  : tablas Silver (Parquet) tipadas, deduplicadas y validadas.
 
 Argumentos del job (los pasa CDK):
   --bronze_database  --silver_database  --silver_path (s3://bucket/prefijo)
+  --dataset (sales | returns)   un dataset por ejecución: cada extracción dispara su pipeline
+  --progress_bucket  --execution_id   (seguimiento de progreso para la web)
 """
 
+import json
 import sys
+import time
+
+import boto3
 
 from awsglue.context import GlueContext
 from awsglue.dynamicframe import DynamicFrame
@@ -23,7 +29,7 @@ from pyspark.context import SparkContext
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "bronze_database", "silver_database", "silver_path"])
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "bronze_database", "silver_database", "silver_path", "dataset", "progress_bucket", "execution_id"])
 
 sc = SparkContext()
 glue_context = GlueContext(sc)
@@ -36,6 +42,37 @@ DATE_FORMAT = "M/d/yyyy"  # formato de fecha del CSV original
 
 class DataQualityError(Exception):
     """Datos que violan una regla no corregible: el job debe fallar."""
+
+
+class Progress:
+    """Escribe el avance de la etapa 'silver' en progress/<dataset>.json (best effort).
+
+    Es una versión mínima de common/progress.py: el job de Glue corre aparte y no
+    comparte el paquete `common` con las Lambdas. Lee el archivo existente porque
+    las etapas anteriores (bronze, dependencies) ya escribieron en él.
+    """
+
+    def __init__(self, dataset):
+        self._s3 = boto3.client("s3")
+        self.key = f"progress/{dataset}.json"
+        self.doc = {"dataset": dataset, "executionId": args["execution_id"], "engine": "glue",
+                    "stages": {"bronze": {"status": "pending"}, "dependencies": {"status": "pending"},
+                               "silver": {"status": "pending"}}}
+        try:
+            existing = json.loads(self._s3.get_object(Bucket=args["progress_bucket"], Key=self.key)["Body"].read())
+            if existing.get("executionId") == args["execution_id"]:
+                self.doc = existing
+        except Exception:
+            pass  # primera escritura o archivo ausente
+
+    def silver(self, status, **info):
+        self.doc["stages"]["silver"] = {"status": status, **info}
+        self.doc["updatedAt"] = time.time()
+        try:
+            self._s3.put_object(Bucket=args["progress_bucket"], Key=self.key,
+                                Body=json.dumps(self.doc).encode(), ContentType="application/json")
+        except Exception as exc:  # el progreso nunca debe romper el job
+            print(f"WARN no se pudo escribir el progreso: {exc}")
 
 
 def read_bronze(table: str) -> DataFrame:
@@ -119,12 +156,24 @@ def build_returns(raw: DataFrame) -> DataFrame:
     return out
 
 
-sales = build_sales(read_bronze("sales"))
-returns = build_returns(read_bronze("returns"))
+BUILDERS = {"sales": (build_sales, ["order_year"]), "returns": (build_returns, None)}
+dataset = args["dataset"]
+if dataset not in BUILDERS:
+    raise ValueError(f"Dataset no soportado por este job: {dataset}")
+builder, partitions = BUILDERS[dataset]
 
-print(f"silver.sales filas={sales.count()} | silver.returns filas={returns.count()}")
-
-write_silver(sales, "sales", partition_keys=["order_year"])
-write_silver(returns, "returns")
+progress = Progress(dataset)
+started = time.time()
+progress.silver("running", startedAt=started)
+try:
+    # leer -> transformar -> validar -> escribir
+    silver_df = builder(read_bronze(dataset))
+    rows = silver_df.count()
+    write_silver(silver_df, dataset, partition_keys=partitions)
+except Exception as exc:
+    progress.silver("failed", startedAt=started, finishedAt=time.time(), error=str(exc)[:600])
+    raise
+print(f"silver.{dataset} filas={rows}")
+progress.silver("succeeded", startedAt=started, finishedAt=time.time(), rows=rows)
 
 job.commit()
