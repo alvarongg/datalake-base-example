@@ -57,15 +57,16 @@ SPA en **React 19 + TypeScript + Vite**, pensada para monitores 16:9 (usa todo e
 | prism-react-renderer | Visor de código con resaltado |
 | Motion | Microanimaciones (respeta "reducir movimiento") |
 
-Siete pestañas, en el orden en que se enseña a construir el data lake:
+Ocho pestañas, en el orden en que se enseña a construir el data lake:
 
 1. **Resumen**: flujo medallion y arquitectura con los [iconos oficiales de AWS](https://aws.amazon.com/architecture/icons/) (`web/src/assets/aws/`). El flujo se ilumina con el estado real.
 2. **Modelo de datos**: ER original (8 tablas de Kaggle, copo de nieve) y optimizado (estrella + agregados). Las tablas **se arrastran y sueltan** (la disposición se guarda en el navegador), las relaciones se anclan a la fila de cada columna y eligen el lado más corto, y al hacer clic en una tabla se resaltan sus relaciones. Incluye "Ordenar automáticamente", el linaje de los agregados y un comparador de velocidad en Athena.
 3. **Pipelines**: una ficha por etapa. **Cada paso abre el código exacto** que lo implementa (el código del repo se embebe en la web al compilar). Explica por qué se usa Lambda (dataset chico) y cuándo pasar a Glue con Spark (más de ~1 millón de registros).
 4. **Operar**: carga de CSV y mapa React Flow con un nodo por tabla: etapas en vivo, "Solo este" / "Con dependencias" y acceso al código. Debajo, el grafo de modelos Gold. Incluye el reinicio.
-5. **Consultar**: tablero de comando (8 paneles, cada uno una consulta Athena sobre Gold con su gráfico D3) y consulta libre con gráfico.
-6. **Costos**: estimación casi en tiempo real (se recalcula cada minuto) por servicio: Lambda, Glue, Athena, Step Functions, S3, API Gateway, CloudFront y CloudWatch Logs. Lee el uso real (CloudWatch, historial de Glue/Athena/Step Functions, tamaño de S3) y aplica precios de lista (`backend/common/pricing.py`). Es una estimación: la factura real llega a Cost Explorer con hasta 24 h de retraso.
-7. **Observabilidad**: logs de CloudWatch de cada componente (todas las Lambdas, los dos flujos de Step Functions y el job de Glue) con errores y warnings resaltados, búsqueda, modo en vivo, y las últimas ejecuciones con la causa del fallo.
+5. **Buckets S3**: cómo se ordenan las rutas de cada bucket y qué contienen (explorador de carpetas con cantidad de archivos, peso y antigüedad), el movimiento en vivo de cada CSV de `landing/adventureworks/` a `landing/archive/` con la fecha de procesamiento resaltada, el historial de movimientos y el botón **Simular evento sin archivo** con el seguimiento paso a paso hasta la DLQ final.
+6. **Consultar**: tablero de comando (8 paneles, cada uno una consulta Athena sobre Gold con su gráfico D3) y consulta libre con gráfico.
+7. **Costos**: estimación casi en tiempo real (se recalcula cada minuto) por servicio: Lambda, Glue, Athena, Step Functions, S3, API Gateway, CloudFront y CloudWatch Logs. Lee el uso real (CloudWatch, historial de Glue/Athena/Step Functions, tamaño de S3) y aplica precios de lista (`backend/common/pricing.py`). Es una estimación: la factura real llega a Cost Explorer con hasta 24 h de retraso.
+8. **Observabilidad**: logs de CloudWatch de cada componente (todas las Lambdas, los dos flujos de Step Functions y el job de Glue) con errores y warnings resaltados, búsqueda, modo en vivo, y las últimas ejecuciones con la causa del fallo.
 
 Requiere Node >= 20.19 (Vite 7). Desarrollo local: `cd web && npm ci && npm run dev` (necesita `web/public/config.json`, que genera `deplo.sh`).
 

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react';
 import { Button, Spinner } from '@heroui/react';
-import { Activity, BarChart3, Database, DollarSign, Layers, LogOut, Play, Workflow } from 'lucide-react';
+import { Activity, BarChart3, Database, DollarSign, HardDrive, Layers, LogOut, Play, Workflow } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import { CodeViewerProvider } from './components/CodeViewer';
@@ -14,6 +14,7 @@ const Overview = lazy(() => import('./views/Overview'));
 const DataModel = lazy(() => import('./views/DataModel'));
 const Pipelines = lazy(() => import('./views/Pipelines'));
 const Operate = lazy(() => import('./views/Operate'));
+const Buckets = lazy(() => import('./views/Buckets'));
 const Consult = lazy(() => import('./views/Consult'));
 const Costs = lazy(() => import('./views/Costs'));
 const Observability = lazy(() => import('./views/Observability'));
@@ -24,6 +25,7 @@ const TABS: { id: string; label: string; icon: ReactNode; view: ReactNode }[] = 
   { id: 'modelo', label: 'Modelo de datos', icon: <Database className="size-4" />, view: <DataModel /> },
   { id: 'pipelines', label: 'Pipelines', icon: <Workflow className="size-4" />, view: <Pipelines /> },
   { id: 'operar', label: 'Operar', icon: <Play className="size-4" />, view: <Operate /> },
+  { id: 'buckets', label: 'Buckets S3', icon: <HardDrive className="size-4" />, view: <Buckets /> },
   { id: 'consultar', label: 'Consultar', icon: <BarChart3 className="size-4" />, view: <Consult /> },
   { id: 'costos', label: 'Costos', icon: <DollarSign className="size-4" />, view: <Costs /> },
   { id: 'observabilidad', label: 'Observabilidad', icon: <Activity className="size-4" />, view: <Observability /> },

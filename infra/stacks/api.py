@@ -116,6 +116,7 @@ class ApiStack(Stack):
             (apigw.HttpMethod.GET, "/state"),
             (apigw.HttpMethod.GET, "/events"),
             (apigw.HttpMethod.GET, "/storage"),
+            (apigw.HttpMethod.GET, "/storage/objects"),
             (apigw.HttpMethod.POST, "/mode"),
             (apigw.HttpMethod.POST, "/landing/restore"),
             (apigw.HttpMethod.POST, "/events/simulate"),

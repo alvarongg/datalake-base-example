@@ -32,3 +32,11 @@ def test_invalid_requests_are_rejected(api, dataset, mode):
     with pytest.raises(api.HttpError) as err:
         api.plan_dataset_run(dataset, mode)
     assert err.value.status == 400
+
+
+@pytest.mark.parametrize("params", [{"bucket": "otro"}, {"bucket": "landing", "prefix": "../x"}, {"bucket": "landing", "prefix": "/abs"}])
+def test_list_objects_rejects_unknown_buckets_and_bad_prefixes(api, params, monkeypatch):
+    monkeypatch.setattr(api, "_lake_buckets", lambda: {"landing": "b-landing"})
+    with pytest.raises(api.HttpError) as err:
+        api.list_objects({"queryStringParameters": params})
+    assert err.value.status == 400

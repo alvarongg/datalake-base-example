@@ -5,6 +5,7 @@ Rutas (todas exigen un token de Cognito, lo valida API Gateway antes de llegar a
   GET  /state               -> estado de datasets, modelos Gold, modo, colas y programación
   GET  /events              -> feed de decisiones del despachador event-driven
   GET  /storage             -> cantidad de archivos y peso por ruta de cada bucket
+  GET  /storage/objects     -> contenido de un bucket (explorador de la web)
   POST /mode                -> cambia entre event-driven y programado
   POST /upload-url          -> URL prefirmada para subir UN csv directo a S3
   POST /landing/restore     -> devuelve a landing la última versión archivada (dispara eventos reales de S3)
@@ -247,11 +248,39 @@ def get_events(event):
     return 200, {"events": feed}
 
 
+MAX_LISTED_OBJECTS = 1000
+
+
+def _lake_buckets() -> dict[str, str]:
+    """Etiqueta -> nombre real. Solo estos buckets se pueden explorar desde la web (lista blanca)."""
+    s = get_settings()
+    return {"landing": s.landing_bucket, "bronze": s.bronze_bucket, "silver": s.silver_bucket,
+            "gold": s.gold_bucket, "athena-results": s.athena_results_bucket}
+
+
+def list_objects(event):
+    """Contenido de UN bucket (o de una ruta dentro de él) para el explorador de la web."""
+    params = event.get("queryStringParameters") or {}
+    label, prefix = params.get("bucket", "landing"), params.get("prefix", "")
+    buckets = _lake_buckets()
+    if label not in buckets:
+        raise HttpError(400, f"bucket debe ser uno de: {', '.join(buckets)}.")
+    if len(prefix) > 300 or ".." in prefix or prefix.startswith("/"):
+        raise HttpError(400, "Ruta inválida.")
+    objects = []
+    for page in _s3.get_paginator("list_objects_v2").paginate(
+            Bucket=buckets[label], Prefix=prefix, PaginationConfig={"MaxItems": MAX_LISTED_OBJECTS + 1}):
+        for o in page.get("Contents", []):
+            objects.append({"key": o["Key"], "size": o["Size"], "lastModified": o["LastModified"].isoformat(),
+                            "etag": o["ETag"].strip('"')})
+    return 200, {"bucket": label, "name": buckets[label], "prefix": prefix,
+                 "objects": objects[:MAX_LISTED_OBJECTS], "truncated": len(objects) > MAX_LISTED_OBJECTS,
+                 "generatedAt": datetime.now(timezone.utc).isoformat()}
+
+
 def get_storage(event):
     """Cantidad de archivos y peso por ruta (hasta 3 niveles) de cada bucket del lake."""
-    s = get_settings()
-    buckets = {"landing": s.landing_bucket, "bronze": s.bronze_bucket, "silver": s.silver_bucket,
-               "gold": s.gold_bucket, "athena-results": s.athena_results_bucket}
+    buckets = _lake_buckets()
 
     def scan(item):
         label, name = item
@@ -506,6 +535,7 @@ ROUTES = {
     "GET /state": get_state,
     "GET /events": get_events,
     "GET /storage": get_storage,
+    "GET /storage/objects": list_objects,
     "POST /mode": change_mode,
     "POST /upload-url": create_upload_url,
     "POST /landing/restore": restore_from_archive,

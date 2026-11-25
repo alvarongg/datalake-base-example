@@ -81,6 +81,7 @@ export interface LakeState {
 }
 export interface FeedEvent { ts: number; level: 'info' | 'ok' | 'wait' | 'error'; kind: string; target: string; text: string; trace?: string; attempt?: number }
 export interface StoragePrefix { prefix: string; depth: number; files: number; bytes: number; lastModified: string | null }
+export interface S3Object { key: string; size: number; lastModified: string; etag: string }
 export interface StorageBucket { label: string; bucket: string; files: number; bytes: number; prefixes: StoragePrefix[] }
 
 export interface QueryResult {
@@ -138,6 +139,9 @@ export const api = {
   setMode: (mode: PipelineMode) => call<{ mode: PipelineMode; resentEvents: string[] }>('POST', '/mode', { mode }),
   events: () => call<{ events: FeedEvent[] }>('GET', '/events'),
   storage: () => call<{ buckets: StorageBucket[]; generatedAt: string }>('GET', '/storage'),
+  objects: (bucket: string, prefix = '') =>
+    call<{ bucket: string; name: string; prefix: string; objects: S3Object[]; truncated: boolean; generatedAt: string }>(
+      'GET', `/storage/objects?${new URLSearchParams({ bucket, prefix })}`),
   restore: (dataset = 'all') => call<{ restored: { file: string; from: string }[]; missing: string[] }>('POST', '/landing/restore', { dataset }),
   simulateMissing: (filename: string) => call<{ sent: string }>('POST', '/events/simulate', { filename }),
   redriveDlq: () => call<{ messages: number }>('POST', '/dlq/redrive'),
