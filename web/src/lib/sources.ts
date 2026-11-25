@@ -23,4 +23,5 @@ export function lineOf(path: string, needle?: string): number | undefined {
   return idx >= 0 ? idx + 1 : undefined;
 }
 
-export const GITHUB_BASE = 'https://github.com/alvarongg/datalake-base-example/blob/bootstrap/';
+// Se define al compilar (deplo.sh la deduce del remote); vacía = sin enlace a GitHub.
+export const GITHUB_BASE: string = import.meta.env.VITE_GITHUB_BASE ?? '';
