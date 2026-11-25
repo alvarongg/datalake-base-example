@@ -80,7 +80,7 @@ def landing_version(dataset: Dataset, objects: dict[str, dict]) -> str | None:
     if any(f not in objects for f in dataset.files):
         return None
     raw = "|".join(f"{f}:{objects[f]['etag']}" for f in dataset.files)
-    return hashlib.sha1(raw.encode()).hexdigest()[:12]
+    return hashlib.sha1(raw.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 def silver_token(control: dict | None) -> str | None:

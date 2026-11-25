@@ -28,7 +28,7 @@
 #   ./deplo.sh test         Solo corre los tests
 #
 # Variables opcionales:
-#   AWS_PROFILE          perfil de AWS CLI           (default: udemy_alvaro)
+#   AWS_PROFILE          perfil de AWS CLI           (default: cadena estándar de credenciales)
 #   AWS_REGION           región                      (default: us-east-1)
 #   DEMO_USER_EMAIL      usuario de Cognito a crear  (default: demo@example.com)
 #   DEMO_USER_PASSWORD   contraseña del usuario      (default: se genera al azar)
@@ -42,7 +42,6 @@ ROOT="$PWD"
 # ---------------------------------------------------------------------------
 # 0. Configuración
 # ---------------------------------------------------------------------------
-export AWS_PROFILE="${AWS_PROFILE:-udemy_alvaro}"
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 export AWS_PAGER=""                                  # evita que la CLI abra un paginador
@@ -71,7 +70,7 @@ output() {  # uso: output <stack> <OutputKey>
 # 1. Prerrequisitos y credenciales
 # ---------------------------------------------------------------------------
 check_prereqs() {
-  log "1/9 Verificando herramientas y credenciales (perfil: $AWS_PROFILE, región: $AWS_REGION)"
+  log "1/9 Verificando herramientas y credenciales (perfil: ${AWS_PROFILE:-default}, región: $AWS_REGION)"
   for bin in aws node npm python3; do
     command -v "$bin" >/dev/null || fail "Falta '$bin' en el PATH"
   done
@@ -80,7 +79,7 @@ check_prereqs() {
     || fail "Se necesita Node >= 20.19 (tienes $(node -v)). Instala Node 22 LTS y vuelve a intentar."
   # Si las credenciales no sirven, fallamos ya, antes de construir nada.
   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)" \
-    || fail "El perfil '$AWS_PROFILE' no tiene credenciales válidas (prueba 'aws sso login' o 'aws configure')"
+    || fail "Las credenciales (perfil '${AWS_PROFILE:-default}') no tiene credenciales válidas (prueba 'aws sso login' o 'aws configure')"
   export CDK_DEFAULT_ACCOUNT="$ACCOUNT_ID" CDK_DEFAULT_REGION="$AWS_REGION"
   echo "Cuenta AWS: $ACCOUNT_ID"
 }
@@ -140,6 +139,11 @@ build_web() {
 EOF
   log "7/9 Compilando la web (React + Vite: tipos con tsc y bundle optimizado)"
   # npm ci instala exactamente lo que dice package-lock.json (builds reproducibles).
+  # URL base de GitHub para el botón "GitHub" del visor de código (se deduce del remote).
+  if [[ -z "${VITE_GITHUB_BASE:-}" ]]; then
+    _remote="$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^git@github.com:#https://github.com/#; s#\.git$##' || true)"
+    [[ "$_remote" == https://github.com/* ]] && export VITE_GITHUB_BASE="$_remote/blob/$(git rev-parse --abbrev-ref HEAD)/"
+  fi
   (cd web && npm ci --no-audit --no-fund && npm run build)
 }
 

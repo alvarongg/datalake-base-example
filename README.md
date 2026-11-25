@@ -165,7 +165,7 @@ Todo el paso a paso está en [`deplo.sh`](deplo.sh) (comentado como tutorial). R
 ./deplo.sh destroy      # elimina toda la infraestructura
 ```
 
-Perfil por defecto `udemy_alvaro`, región `us-east-1` (`AWS_PROFILE`, `AWS_REGION` para cambiarlos). Al terminar imprime la URL de la web y las credenciales del usuario demo.
+Usa la cadena estándar de credenciales de AWS; para elegir un perfil exporta `AWS_PROFILE=<perfil>`. Región por defecto `us-east-1` (`AWS_REGION`). Al terminar imprime la URL de la web y las credenciales del usuario demo.
 
 ## Poblar desde cero
 

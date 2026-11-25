@@ -75,9 +75,11 @@ function CodeBlock({ path, highlight }: { path: string; highlight?: string }) {
           <Button size="sm" variant="ghost" onPress={() => navigator.clipboard.writeText(code).then(() => toast.success('Código copiado'))}>
             <Copy className="size-3.5" /> Copiar
           </Button>
-          <a className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-surface-secondary" href={`${GITHUB_BASE}${path}`} target="_blank" rel="noreferrer">
-            <ExternalLink className="size-3.5" /> GitHub
-          </a>
+          {GITHUB_BASE && (
+            <a className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-surface-secondary" href={`${GITHUB_BASE}${path}`} target="_blank" rel="noreferrer">
+              <ExternalLink className="size-3.5" /> GitHub
+            </a>
+          )}
         </div>
       </div>
       <div ref={scroller} className="min-h-0 flex-1 overflow-auto px-2 pb-6">
