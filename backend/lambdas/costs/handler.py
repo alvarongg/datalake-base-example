@@ -46,7 +46,7 @@ MAX_S3_OBJECTS_PER_BUCKET = 50_000
 SERVICE_LABELS = {
     "lambda": "AWS Lambda", "glue": "AWS Glue", "athena": "Amazon Athena", "stepfunctions": "AWS Step Functions",
     "s3": "Amazon S3", "apigateway": "Amazon API Gateway", "cloudfront": "Amazon CloudFront",
-    "logs": "CloudWatch Logs", "cognito": "Amazon Cognito",
+    "logs": "CloudWatch Logs", "cognito": "Amazon Cognito", "sqs": "Amazon SQS", "eventbridge": "Amazon EventBridge",
 }
 
 
@@ -283,6 +283,14 @@ def collect(rng: str, cfg: dict) -> dict:
             lambda m: P.cloudfront_cost(m["req"], m["bytes"]),
             lambda t: [{"label": "Requests", "value": int(t["req"]), "unit": ""},
                        {"label": "Datos servidos", "value": round(t["bytes"] / 1024**2, 2), "unit": "MB"}]),
+        "sqs": lambda: cost_simple(
+            ctx, "sqs",
+            {f"{m}:{q}": ("AWS/SQS", m, [{"Name": "QueueName", "Value": q}], "Sum")
+             for q in cfg.get("queues", {}).values()
+             for m in ("NumberOfMessagesSent", "NumberOfMessagesReceived", "NumberOfMessagesDeleted", "NumberOfEmptyReceives")},
+            lambda m: P.sqs_cost(sum(m.values())),
+            lambda t: [{"label": "Requests", "value": int(sum(t.values())), "unit": ""},
+                       {"label": "Mensajes enviados", "value": int(sum(v for k, v in t.items() if k.startswith("NumberOfMessagesSent"))), "unit": ""}]),
         "logs": lambda: cost_simple(
             ctx, "logs",
             {f"g{i}": ("AWS/Logs", "IncomingBytes", [{"Name": "LogGroupName", "Value": g}], "Sum") for i, g in enumerate(cfg["logGroups"])},
@@ -300,6 +308,12 @@ def collect(rng: str, cfg: dict) -> dict:
 
     with ThreadPoolExecutor(8) as pool:
         services = list(pool.map(run, tasks.items()))
+    for s in services:
+        if s["id"] == "sqs":
+            s["note"] = ("La Lambda hace long polling continuo sobre 2 colas: aun sin mensajes genera "
+                         "~unos cientos de miles de requests al mes (centavos). Es el costo fijo de event-driven.")
+    services.append(service("eventbridge", ctx.zeros(), [{"label": "Reglas", "value": 2, "unit": ""}],
+                            note="Los eventos de servicios de AWS (fin de Glue) y las reglas programadas no tienen costo."))
     services.append(service("cognito", ctx.zeros(), [{"label": "Usuarios activos", "value": 0, "unit": ""}],
                             note="Cognito es gratis hasta 50.000 usuarios activos al mes (capa gratuita)."))
 

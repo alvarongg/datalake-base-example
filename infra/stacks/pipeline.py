@@ -1,15 +1,19 @@
-"""Los pipelines: Lambdas + Glue Job + dos máquinas de estados de Step Functions.
+"""Los pipelines, en DOS arquitecturas que se pueden comparar (el modo se elige en la web):
 
-PIPELINE DE DATASETS (uno por archivo/tabla; se pueden encadenar en orden)
+EVENT-DRIVEN (modo "event", por defecto)
 
-   Plan ─► Map (un dataset a la vez, en orden de dependencias)
-            │  Bronze ─► CheckDependencies ─► ¿motor? ─┬─► SilverPandas (Lambda) ─┐
-            │             (falla si una tabla padre     └─► SilverGlue (Spark)  ───┴─► RecordSilver
-            │              no está al día)
+   S3 PUT ─► SQS events ─► Lambda despachador ─► Bronze → Silver (pandas | Glue) → Gold
+                ▲  ▲               │ condición no cumplida
+   EventBridge ─┘  └── 20 s ── SQS retry-dlq            error / 15 intentos ─► SQS dead-letter
+   (fin de Glue)
 
-PIPELINE GOLD (modelos SQL; todos o algunos)
+PROGRAMADA (modo "scheduled")
 
-   Gold ─► valida dependencias (Silver al día) ─► CTAS en Athena por modelo
+   EventBridge cada 30 min ─► Step Functions "scheduled":
+        PlanProgramado ─► ¿hay trabajo? ─► datasets (Map en orden) ─► Gold (solo lo desactualizado)
+
+Ambas reutilizan el MISMO código de cada capa (run_bronze, run_silver_pandas,
+build_model, job de Glue): cambia solo el orquestador.
 
 Cada permiso IAM se concede de forma explícita y mínima: ninguna función
 puede tocar una capa que no necesita.
@@ -18,7 +22,12 @@ puede tocar una capa que no necesita.
 from pathlib import Path
 
 from aws_cdk import (
+    ArnFormat,
     CfnOutput, Duration, RemovalPolicy, Stack,
+    aws_events as events,
+    aws_events_targets as targets,
+    aws_lambda_event_sources as event_sources,
+    aws_ssm as ssm,
     aws_glue as glue,
     aws_iam as iam,
     aws_lambda as _lambda,
@@ -38,6 +47,8 @@ GLUE_SCRIPT = str(Path(BACKEND_DIR) / "glue" / "silver_facts.py")
 # dependencias pesadas). Versiones: https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
 PANDAS_LAYER_VERSION = 32
 GLUE_JOB_NAME = "datalake-demo-silver-facts"
+MODE_PARAM = "/datalake-demo/pipeline-mode"
+SCHEDULE_MINUTES = 30
 
 GLUE_ACTIONS = [
     "glue:GetDatabase", "glue:GetDatabases", "glue:GetTable", "glue:GetTables",
@@ -97,7 +108,12 @@ class PipelineStack(Stack):
             "SILVER_DB": lake.silver_db,
             "GOLD_DB": lake.gold_db,
             "ATHENA_WORKGROUP": lake.workgroup,
+            "PIPELINE_MODE_PARAM": MODE_PARAM,
         }
+        # Modo de operación (event | scheduled). SSM Parameter Store estándar: sin costo.
+        self.mode_param = ssm.StringParameter(
+            self, "PipelineMode", parameter_name=MODE_PARAM, string_value="event",
+            description="Modo del pipeline: event (event-driven) o scheduled (Step Functions programado)")
         self.pandas_layer = _lambda.LayerVersion.from_layer_version_arn(
             self, "PandasLayer",
             f"arn:aws:lambda:{self.region}:336392948345:layer:AWSSDKPandas-Python312:{PANDAS_LAYER_VERSION}",
@@ -120,6 +136,7 @@ class PipelineStack(Stack):
         for fn in (bronze_fn, deps_fn, gold_fn):
             lake.landing.grant_read(fn)
 
+        lake.landing.grant_read_write(bronze_fn)  # mover a archive/ = copiar + borrar
         lake.bronze.grant_read_write(bronze_fn)
         bronze_fn.add_to_role_policy(glue_policy(self, [lake.bronze_db], GLUE_ACTIONS))
 
@@ -195,7 +212,7 @@ class PipelineStack(Stack):
         )
         bronze_step = tasks.LambdaInvoke(
             self, "Bronze", lambda_function=bronze_fn, payload_response_only=True,
-            payload=item_payload, result_path="$.bronze",
+            payload=item_payload, result_path="$.bronze", task_timeout=sfn.Timeout.duration(Duration.minutes(6)),
         )
         deps_step = tasks.LambdaInvoke(
             self, "CheckDependencies", lambda_function=deps_fn, payload_response_only=True,
@@ -203,7 +220,7 @@ class PipelineStack(Stack):
         )
         silver_pandas = tasks.LambdaInvoke(
             self, "SilverPandas", lambda_function=silver_fn, payload_response_only=True,
-            payload=item_payload, result_path="$.silver",
+            payload=item_payload, result_path="$.silver", task_timeout=sfn.Timeout.duration(Duration.minutes(6)),
         )
         silver_glue = tasks.GlueStartJobRun(
             self, "SilverGlue", glue_job_name=glue_job.name,
@@ -211,7 +228,11 @@ class PipelineStack(Stack):
             arguments=sfn.TaskInput.from_object({"--dataset": dataset, "--execution_id": exec_id}),
             result_selector={"job_run_id.$": "$.Id", "state.$": "$.JobRunState", "seconds.$": "$.ExecutionTime"},
             result_path="$.silver",
+            task_timeout=sfn.Timeout.duration(Duration.minutes(20)),
         )
+        # Glue admite 2 corridas a la vez: si se supera, reintentar con backoff en vez de fallar.
+        silver_glue.add_retry(errors=["Glue.ConcurrentRunsExceededException"], interval=Duration.seconds(30),
+                              backoff_rate=2, max_attempts=4)
         record_step = tasks.LambdaInvoke(
             self, "RecordSilver", lambda_function=finalize_fn, payload_response_only=True,
             payload=sfn.TaskInput.from_object({
@@ -245,12 +266,15 @@ class PipelineStack(Stack):
             definition_body=sfn.DefinitionBody.from_chainable(plan_step.next(for_each)),
             timeout=Duration.hours(1),
             logs=sfn.LogOptions(destination=self.dataset_logs, level=sfn.LogLevel.ALL),
+            tracing_enabled=True,  # X-Ray: ver cuánto tarda cada paso (capa gratuita: 100 mil trazas/mes)
         )
 
         # ---- Step Functions: pipeline GOLD -------------------------------
         gold_step = tasks.LambdaInvoke(
             self, "Gold", lambda_function=gold_fn, payload_response_only=True,
-            payload=sfn.TaskInput.from_object({"models": sfn.JsonPath.list_at("$.models"), "executionId": exec_id}),
+            # Se pasa el pedido completo: models, onlyStale, onlyReady.
+            payload=sfn.TaskInput.from_object({"request": sfn.JsonPath.object_at("$"), "executionId": exec_id}),
+            task_timeout=sfn.Timeout.duration(Duration.minutes(11)),
         )
         self.gold_machine = sfn.StateMachine(
             self, "GoldPipeline",
@@ -258,11 +282,114 @@ class PipelineStack(Stack):
             definition_body=sfn.DefinitionBody.from_chainable(gold_step),
             timeout=Duration.hours(1),
             logs=sfn.LogOptions(destination=self.gold_logs, level=sfn.LogLevel.ALL),
+            tracing_enabled=True,
         )
+
+        self._scheduled_flow(glue_job)
+        self._event_driven(lake, glue_job)
 
         CfnOutput(self, "DatasetStateMachineArn", value=self.dataset_machine.state_machine_arn)
         CfnOutput(self, "GoldStateMachineArn", value=self.gold_machine.state_machine_arn)
         CfnOutput(self, "ResetFunctionName", value=self.reset_fn.function_name)
+
+    # ------------------------------------------------------------------
+    def _scheduled_flow(self, glue_job) -> None:
+        """Arquitectura PROGRAMADA: EventBridge dispara cada 30 min un flujo que procesa todo lo nuevo."""
+        lake = self.lake
+        plan_fn = self._function("SchedulePlan", "lambdas.schedule_plan.handler.lambda_handler", Duration.seconds(30), layer=False, memory=256)
+        lake.landing.grant_read(plan_fn)
+        lake.athena_results.grant_read(plan_fn, "control/*")
+        self.mode_param.grant_read(plan_fn)
+        # ARN armado por nombre (no por referencia) para no crear un ciclo función ↔ máquina.
+        scheduled_arn = self.format_arn(service="states", resource="stateMachine", resource_name="datalake-demo-scheduled",
+                                        arn_format=ArnFormat.COLON_RESOURCE_NAME)
+        plan_fn.add_environment("SCHEDULED_STATE_MACHINE_ARN", scheduled_arn)
+        plan_fn.add_to_role_policy(iam.PolicyStatement(actions=["states:ListExecutions"], resources=[scheduled_arn]))
+
+        plan = tasks.LambdaInvoke(self, "PlanProgramado", lambda_function=plan_fn, payload_response_only=True,
+                                  payload=sfn.TaskInput.from_object({"manual": sfn.JsonPath.object_at("$.manual"),
+                                                                     "executionId": sfn.JsonPath.string_at("$$.Execution.Id")}),
+                                  result_path="$.plan", task_timeout=sfn.Timeout.duration(Duration.minutes(1)))
+        # Flujos anidados (.sync:2): el padre espera al hijo y hereda su resultado. Cada hijo
+        # se puede ejecutar y probar solo, y el padre queda simple.
+        run_datasets = tasks.StepFunctionsStartExecution(
+            self, "ProcesarDatasets", state_machine=self.dataset_machine,
+            integration_pattern=sfn.IntegrationPattern.RUN_JOB,
+            input=sfn.TaskInput.from_object({"datasets": sfn.JsonPath.list_at("$.plan.datasets")}),
+            associate_with_parent=True, result_path=sfn.JsonPath.DISCARD)
+        run_gold = tasks.StepFunctionsStartExecution(
+            self, "ConstruirGold", state_machine=self.gold_machine,
+            integration_pattern=sfn.IntegrationPattern.RUN_JOB,
+            input=sfn.TaskInput.from_object({"models": [], "onlyStale": True, "onlyReady": True}),
+            associate_with_parent=True, result_path=sfn.JsonPath.DISCARD)
+        # Reintento con backoff exponencial si Step Functions está saturado (error transitorio).
+        for t in (run_datasets, run_gold):
+            t.add_retry(errors=["StepFunctions.ExecutionLimitExceeded", "StepFunctions.SdkClientException"],
+                        interval=Duration.seconds(5), backoff_rate=2, max_attempts=3)
+        failed = sfn.Fail(self, "FalloProgramado", error="PipelineFailed",
+                          cause="Falló un paso del lote programado: revisa la ejecución hija")
+        run_datasets.add_catch(failed, errors=["States.ALL"], result_path="$.error")
+        run_gold.add_catch(failed, errors=["States.ALL"], result_path="$.error")
+
+        gold_or_done = (sfn.Choice(self, "HayGoldPendiente")
+                        .when(sfn.Condition.boolean_equals("$.plan.goldWork", True), run_gold)
+                        .otherwise(sfn.Succeed(self, "TodoAlDia", comment="Nada nuevo que procesar")))
+        definition = plan.next(
+            sfn.Choice(self, "ModoProgramado")
+            .when(sfn.Condition.boolean_equals("$.plan.skip", True),
+                  sfn.Succeed(self, "ModoEventDriven", comment="El modo event-driven está activo: no se hace nada"))
+            .when(sfn.Condition.boolean_equals("$.plan.hasDatasets", True), run_datasets.next(gold_or_done))
+            .otherwise(gold_or_done))
+
+        self.scheduled_logs = logs.LogGroup(self, "ScheduledPipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
+                                            removal_policy=RemovalPolicy.DESTROY)
+        self.scheduled_machine = sfn.StateMachine(
+            self, "ScheduledPipeline", state_machine_name="datalake-demo-scheduled",
+            definition_body=sfn.DefinitionBody.from_chainable(definition), timeout=Duration.hours(2),
+            logs=sfn.LogOptions(destination=self.scheduled_logs, level=sfn.LogLevel.ALL), tracing_enabled=True)
+
+        # Disparador programado. Siempre activo: si el modo es event-driven, el flujo termina al instante
+        # (así un redeploy de CDK nunca deja la regla en un estado distinto al del modo).
+        events.Rule(self, "ScheduleRule", rule_name="datalake-demo-schedule",
+                    description=f"Ejecuta el pipeline programado cada {SCHEDULE_MINUTES} minutos",
+                    schedule=events.Schedule.rate(Duration.minutes(SCHEDULE_MINUTES)),
+                    targets=[targets.SfnStateMachine(self.scheduled_machine,
+                                                     input=events.RuleTargetInput.from_object({"manual": False}))])
+        CfnOutput(self, "ScheduledStateMachineArn", value=self.scheduled_machine.state_machine_arn)
+
+    def _event_driven(self, lake, glue_job) -> None:
+        """Arquitectura EVENT-DRIVEN: SQS → Lambda despachador → siguiente paso."""
+        fn = self._function("Dispatcher", "lambdas.dispatcher.handler.lambda_handler", Duration.minutes(2))
+        fn.add_environment("EVENTS_QUEUE_URL", lake.events_queue.queue_url)
+        fn.add_environment("RETRY_QUEUE_URL", lake.retry_queue.queue_url)
+        fn.add_environment("DLQ_URL", lake.dead_letter.queue_url)
+        fn.add_environment("GLUE_JOB_NAME", GLUE_JOB_NAME)
+
+        # Hace lo mismo que Bronze + Silver + Gold, así que necesita la suma de sus permisos (y nada más).
+        for bucket in (lake.landing, lake.bronze, lake.silver, lake.gold, lake.athena_results):
+            bucket.grant_read_write(fn)
+        fn.add_to_role_policy(glue_policy(self, [lake.bronze_db, lake.silver_db, lake.gold_db], GLUE_ACTIONS))
+        fn.add_to_role_policy(athena_policy(self, lake.workgroup))
+        fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["glue:StartJobRun", "glue:GetJobRun"],
+            resources=[self.format_arn(service="glue", resource="job", resource_name=GLUE_JOB_NAME)]))
+        for q in (lake.events_queue, lake.retry_queue, lake.dead_letter):
+            q.grant_send_messages(fn)
+        self.mode_param.grant_read(fn)
+
+        # Dos colas, la misma Lambda. batch_size=1: cada mensaje es una decisión (más fácil de seguir en los logs).
+        # report_batch_item_failures: si falla un mensaje, solo ese vuelve a la cola.
+        # max_concurrency=2: tope de Lambdas en paralelo por cola (protege a Athena y al costo).
+        for q in (lake.events_queue, lake.retry_queue):
+            fn.add_event_source(event_sources.SqsEventSource(q, batch_size=1, report_batch_item_failures=True, max_concurrency=2))
+
+        # Fin de un job de Glue -> EventBridge -> cola events (L1 para no crear dependencias circulares entre stacks).
+        events.CfnRule(self, "GlueStateChangeRule", name="datalake-demo-glue-finished",
+                       description="Avisa al despachador cuando termina un job de Silver en Glue",
+                       event_pattern={"source": ["aws.glue"], "detail-type": ["Glue Job State Change"],
+                                      "detail": {"jobName": [GLUE_JOB_NAME], "state": ["SUCCEEDED", "FAILED", "TIMEOUT", "STOPPED", "ERROR"]}},
+                       targets=[events.CfnRule.TargetProperty(id="events-queue", arn=lake.events_queue.queue_arn)])
+        self.dispatcher_fn = fn
 
     def _function(self, name: str, handler: str, timeout: Duration, layer: bool = True, memory: int = 1024) -> _lambda.Function:
         fn = _lambda.Function(

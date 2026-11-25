@@ -11,9 +11,9 @@ import { api, type LogEvent } from '@/lib/api';
 import { cn, fmtTime } from '@/lib/utils';
 
 const WINDOWS = [[15, '15 min'], [60, '1 hora'], [360, '6 horas'], [1440, '24 horas']] as const;
-const STAGE_ORDER = ['api', 'plan', 'bronze', 'dependencies', 'silver', 'orchestration', 'gold', 'reset'];
+const STAGE_ORDER = ['api', 'event', 'plan', 'bronze', 'dependencies', 'silver', 'orchestration', 'gold', 'reset'];
 const STAGE_LABEL: Record<string, string> = {
-  api: 'API', plan: 'Orquestación', bronze: 'Bronze', dependencies: 'Dependencias', silver: 'Silver', orchestration: 'Orquestación', gold: 'Gold', reset: 'Mantenimiento',
+  api: 'API', event: 'Event-driven', plan: 'Orquestación', bronze: 'Bronze', dependencies: 'Dependencias', silver: 'Silver', orchestration: 'Orquestación', gold: 'Gold', reset: 'Mantenimiento',
 };
 const KIND_ICON: Record<string, AwsService> = { lambda: 'lambda', sfn: 'stepFunctions', glue: 'glue' };
 // Código que corresponde a cada componente (para saltar del log al código).
@@ -22,6 +22,8 @@ const SOURCE_CODE: Record<string, string[]> = {
   dependencies: ['backend/lambdas/dependencies/handler.py', 'backend/common/control.py'], silver_pandas: ['backend/lambdas/silver_dimensions/handler.py'],
   finalize: ['backend/lambdas/finalize/handler.py'], gold: ['backend/lambdas/gold/handler.py'], reset: ['backend/lambdas/reset/handler.py'],
   glue: ['backend/glue/silver_facts.py'], sfn_datasets: ['infra/stacks/pipeline.py'], sfn_gold: ['infra/stacks/pipeline.py'],
+  sfn_scheduled: ['infra/stacks/pipeline.py', 'backend/lambdas/schedule_plan/handler.py'], dispatcher: ['backend/lambdas/dispatcher/handler.py', 'backend/common/events.py'],
+  schedule_plan: ['backend/lambdas/schedule_plan/handler.py'],
 };
 
 const LEVEL_STYLE: Record<string, string> = {
@@ -155,7 +157,7 @@ export default function Observability() {
                     return (
                       <tr key={r.arn} className="border-t border-separator align-top">
                         <td className="whitespace-nowrap px-3 py-2 text-muted">{fmtTime(r.startedAt)}</td>
-                        <td className="px-3 py-2"><span className="flex items-center gap-2"><AwsIcon name={r.kind === 'glue' ? 'glue' : 'stepFunctions'} size={18} />{r.kind === 'glue' ? 'Glue job' : r.kind === 'gold' ? 'Pipeline Gold' : 'Pipeline datasets'}</span></td>
+                        <td className="px-3 py-2"><span className="flex items-center gap-2"><AwsIcon name={r.kind === 'glue' ? 'glue' : 'stepFunctions'} size={18} />{r.kind === 'glue' ? 'Glue job' : r.kind === 'gold' ? 'Pipeline Gold' : r.kind === 'scheduled' ? 'Programado' : 'Pipeline datasets'}</span></td>
                         <td className="max-w-80 px-3 py-2 font-mono text-xs">{r.input.join(' → ') || 'todos'}</td>
                         <td className="px-3 py-2"><StatusChip status={r.status} /></td>
                         <td className="px-3 py-2 tabular-nums text-muted">{dur != null ? `${dur} s` : '…'}</td>

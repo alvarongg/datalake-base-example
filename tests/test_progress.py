@@ -77,12 +77,21 @@ def test_progress_errors_never_break_the_pipeline():
         info["rows"] = 1
 
 
-def test_gold_progress_tracks_blocked_and_built_models():
+def test_gold_progress_writes_one_file_per_model():
     s3 = FakeS3()
     g = GoldProgress("b", "e", ["dim_product", "fact_sales"], client=s3)
+    g.flush()
     g.block("fact_sales", "falta products", [{"dependency": "silver.sales"}])
     with g.table("dim_product"):
         pass
-    tables = {t["name"]: t for t in s3.doc("progress/gold.json")["tables"]}
-    assert tables["dim_product"]["status"] == "succeeded"
-    assert tables["fact_sales"]["status"] == "blocked" and tables["fact_sales"]["detail"]
+    assert s3.doc("progress/gold/dim_product.json")["status"] == "succeeded"
+    blocked = s3.doc("progress/gold/fact_sales.json")
+    assert blocked["status"] == "blocked" and blocked["detail"] and blocked["executionId"] == "e"
+
+
+def test_wait_marks_the_stage_as_waiting_with_attempts():
+    s3 = FakeS3()
+    p = DatasetProgress("b", "products", "evt:x", "pandas", client=s3)
+    p.wait("dependencies", 3, 15, "Esperando", [{"dependency": "product_subcategories"}])
+    st = s3.doc("progress/products.json")["stages"]["dependencies"]
+    assert st["status"] == "waiting" and st["attempt"] == 3 and st["maxAttempts"] == 15

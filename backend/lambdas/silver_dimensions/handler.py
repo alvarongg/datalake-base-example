@@ -7,8 +7,9 @@ Las tablas grandes (ventas, devoluciones) se procesan con Spark en Glue
 (ver backend/glue/silver_facts.py).
 
 La lógica de limpieza vive en ``common/transforms.py`` (funciones puras
-testeadas). Esta Lambda solo lee Bronze, aplica la función y escribe Silver.
-Corre DESPUÉS de la verificación de dependencias.
+testeadas). ``run_silver_pandas`` solo lee Bronze, aplica la función y
+escribe Silver; la usan Step Functions y el despachador event-driven.
+Corre DESPUÉS de verificar las dependencias.
 """
 
 from __future__ import annotations
@@ -19,21 +20,15 @@ import awswrangler as wr
 
 from common.datasets import DATASETS_BY_NAME
 from common.progress import DatasetProgress
-from common.settings import get_settings
+from common.settings import Settings, get_settings
 from common.transforms import SILVER_PANDAS_TRANSFORMS
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-def lambda_handler(event, context):
-    settings = get_settings()
-    table = event["dataset"]
-    ds = DATASETS_BY_NAME[table]
+def run_silver_pandas(settings: Settings, table: str, progress: DatasetProgress) -> dict:
     transform = SILVER_PANDAS_TRANSFORMS[table]  # KeyError si se pide un dataset de Glue
-    progress = DatasetProgress.load(settings.athena_results_bucket, table,
-                                    event.get("executionId"), ds.silver_engine)
-
     with progress.stage("silver") as info:
         # Leemos la tabla Bronze directamente desde S3 (Parquet).
         bronze_df = wr.s3.read_parquet(settings.table_uri("bronze", table), dataset=True)
@@ -57,3 +52,12 @@ def lambda_handler(event, context):
 
     logger.info("silver.%s: %s -> %s filas", table, report.rows_in, report.rows_out)
     return {"layer": "silver", "engine": "pandas", **report.as_dict()}
+
+
+def lambda_handler(event, context):
+    """Entrada desde Step Functions (modo programado)."""
+    settings = get_settings()
+    table = event["dataset"]
+    progress = DatasetProgress.load(settings.athena_results_bucket, table, event.get("executionId"),
+                                    DATASETS_BY_NAME[table].silver_engine)
+    return run_silver_pandas(settings, table, progress)

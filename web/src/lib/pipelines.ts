@@ -7,9 +7,9 @@ export interface PipelineStep { text: string; code?: { file: string; highlight: 
 export interface PipelineDef {
   id: string;
   title: string;
-  layer: 'bronze' | 'deps' | 'silver' | 'gold';
+  layer: 'bronze' | 'deps' | 'silver' | 'gold' | 'orch';
   engine: string;
-  engineKind: 'lambda' | 'glue' | 'athena' | 'control';
+  engineKind: 'lambda' | 'glue' | 'athena' | 'control' | 'orchestrator';
   flow: [AwsService, string, string][];
   goal: string;
   steps: PipelineStep[];
@@ -24,6 +24,42 @@ const DS_STATUS: Record<string, string> = {
 };
 
 export const PIPELINES: PipelineDef[] = [
+  {
+    id: 'event', layer: 'orch', title: 'Orquestación event-driven', engine: 'S3 → SQS → Lambda despachador', engineKind: 'orchestrator',
+    flow: [['s3', 'S3 landing', 'PUT de un CSV'], ['sqs', 'SQS events', 'cola de eventos'], ['lambda', 'Despachador', 'decide el paso'], ['sqs', 'SQS retry-dlq', 'espera 20 s']],
+    goal: 'Cada archivo dispara su propio pipeline apenas llega. No hay un "director de orquesta": cada paso, al terminar, publica el siguiente evento. Si una condición no se cumple, el evento espera 20 s en la DLQ de reintento y vuelve a probar.',
+    steps: [
+      { text: 'S3 notifica cada PUT en landing/adventureworks/*.csv directo a la cola SQS events (archive/ no dispara nada).', code: { file: 'infra/stacks/datalake.py', highlight: 'add_event_notification' } },
+      { text: 'La Lambda despachador lee la cola (lotes de 1, máx. 2 en paralelo) y reconoce el tipo de mensaje: S3, fin de Glue o "siguiente paso".', code: { file: 'backend/common/events.py', highlight: 'def parse_messages' } },
+      { text: 'Bronze: si el archivo NO está en landing es un error (condición principal) y va a la DLQ final; si faltan otros CSV del dataset, espera 20 s.', code: { file: 'backend/common/events.py', highlight: 'def bronze_precheck' } },
+      { text: 'Condición no cumplida: el mensaje se reenvía a retry-dlq (DeliveryDelay 20 s) con el intento + 1; a los 15 intentos va a la DLQ final.', code: { file: 'backend/lambdas/dispatcher/handler.py', highlight: 'def wait' } },
+      { text: 'Silver con Glue: arranca el job y termina; el fin del job llega como evento de EventBridge a la misma cola.', code: { file: 'infra/stacks/pipeline.py', highlight: 'GlueStateChangeRule' } },
+      { text: 'Al terminar Silver publica Silver de las tablas hijas listas y Gold de los modelos que la leen (fan-out).', code: { file: 'backend/lambdas/dispatcher/handler.py', highlight: 'def after_silver' } },
+      { text: 'Dos eventos de la misma tabla: un lock con escritura condicional de S3 deja pasar solo a uno.', code: { file: 'backend/common/events.py', highlight: 'class S3Lock' } },
+    ],
+    rules: ['Idempotente: un evento repetido (ETag ya consumido, tabla al día) no reprocesa.', 'Reporte parcial de lotes: solo se reintenta el mensaje que falló.',
+      'visibility timeout = 6 × timeout de la Lambda; DLQ final con redrive desde la web.', 'Colas cifradas con SSE-SQS (sin costo) y solo TLS.'],
+    why: 'Latencia mínima y cada tabla avanza a su ritmo. Escala sola con la cantidad de archivos. A cambio, el estado está repartido: hacen falta idempotencia, locks y un buen feed de eventos para entender qué pasó.',
+    files: ['backend/lambdas/dispatcher/handler.py', 'backend/common/events.py', 'infra/stacks/datalake.py', 'infra/stacks/pipeline.py'],
+    summary: (s) => ({ head: ['Cola', 'En cola', 'Procesándose', 'Esperando demora'],
+      rows: (['events', 'retry', 'dlq'] as const).map((k) => [k, s.queues[k].visible, s.queues[k].inFlight, s.queues[k].delayed]) }),
+  },
+  {
+    id: 'scheduled', layer: 'orch', title: 'Orquestación programada', engine: 'EventBridge → Step Functions', engineKind: 'orchestrator',
+    flow: [['eventbridge', 'EventBridge', 'cada 30 min'], ['stepFunctions', 'Step Functions', 'datalake-demo-scheduled'], ['lambda', 'Plan', 'qué hay nuevo'], ['stepFunctions', 'Flujos hijos', 'datasets → Gold']],
+    goal: 'Un orquestador central se despierta en horario, arma un lote con todo lo nuevo y lo ejecuta en orden. El estado de cada corrida queda en un solo lugar (la ejecución de Step Functions), con su diagrama, entradas y salidas.',
+    steps: [
+      { text: 'Una regla de EventBridge ejecuta el flujo cada 30 minutos. Si el modo es event-driven, el flujo termina al instante.', code: { file: 'infra/stacks/pipeline.py', highlight: 'ScheduleRule' } },
+      { text: 'PlanProgramado decide el lote: archivos nuevos, tablas con Bronze sin Silver al día y sus hijas, en orden de dependencias.', code: { file: 'backend/lambdas/schedule_plan/handler.py', highlight: 'def plan_datasets' } },
+      { text: 'Ejecuta el flujo hijo de datasets (.sync): Map de un dataset a la vez → Bronze → compuerta de dependencias → Silver.', code: { file: 'infra/stacks/pipeline.py', highlight: 'ProcesarDatasets' } },
+      { text: 'Después el flujo hijo de Gold solo con lo desactualizado (onlyStale) y salteando lo bloqueado (onlyReady).', code: { file: 'backend/lambdas/gold/handler.py', highlight: 'def plan_models' } },
+      { text: 'Reintentos con backoff exponencial ante errores transitorios, timeout por tarea y Catch a un estado de fallo.', code: { file: 'infra/stacks/pipeline.py', highlight: 'add_retry' } },
+    ],
+    rules: ['Flujos anidados (.sync:2): cada hijo se puede probar solo.', 'X-Ray y logs de nivel ALL en las 3 máquinas.', 'Timeout por tarea y timeout total por ejecución.', 'El mismo código de cada capa que event-driven.'],
+    why: 'Fácil de razonar y de auditar: una ejecución = un lote, con un diagrama que muestra dónde falló. Ideal para cargas por lotes (cierres diarios). A cambio, la latencia es la del horario y se procesa por lotes aunque llegue un solo archivo.',
+    files: ['infra/stacks/pipeline.py', 'backend/lambdas/schedule_plan/handler.py', 'backend/lambdas/gold/handler.py'],
+    summary: (s) => ({ head: ['Flujo', 'En ejecución'], rows: Object.entries(s.runningMachines).map(([k, v]) => [k, v ? 'sí' : 'no']) }),
+  },
   {
     id: 'bronze', layer: 'bronze', title: 'Bronze · ingesta cruda', engine: 'AWS Lambda + pandas + awswrangler', engineKind: 'lambda',
     flow: [['s3', 'S3 landing', 'CSV del dataset'], ['lambda', 'Lambda Bronze', 'pandas + awswrangler'], ['s3', 'S3 bronze', 'Parquet'], ['glue', 'Glue Catalog', 'datalake_bronze']],

@@ -23,7 +23,8 @@ async function call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Pr
 
 /* ------------------------------------------------------------------ tipos */
 export type DatasetStatus = 'no_file' | 'pending' | 'bronze' | 'stale' | 'ok';
-export type StageStatus = 'pending' | 'running' | 'succeeded' | 'failed';
+export type StageStatus = 'pending' | 'running' | 'waiting' | 'succeeded' | 'failed';
+export type PipelineMode = 'event' | 'scheduled';
 export type GoldStatus = 'not_built' | 'stale' | 'ok';
 
 export interface StageInfo {
@@ -35,10 +36,19 @@ export interface StageInfo {
   detail?: { dependency: string; status: string; reason: string }[];
   startedAt?: number;
   finishedAt?: number;
+  attempt?: number;
+  maxAttempts?: number;
+  reason?: string;
+  note?: string;
+  skipped?: boolean;
+  archived?: string[];
+  glueRunId?: string;
 }
 export interface DatasetRun {
   executionId: string;
   runStatus: 'RUNNING' | 'SUCCEEDED' | 'FAILED' | string;
+  orchestrator: 'event' | 'stepfunctions';
+  updatedAt?: number;
   queued: boolean;
   stages: Record<'bronze' | 'dependencies' | 'silver', StageInfo>;
 }
@@ -50,6 +60,8 @@ export interface DatasetState {
   files: { name: string; uploaded: boolean; size?: number }[];
   status: DatasetStatus;
   rows: { bronze?: number; silver?: number };
+  lastBronzeAt?: string;
+  archived: string[];
   run: DatasetRun | null;
 }
 export interface GoldState {
@@ -57,9 +69,19 @@ export interface GoldState {
   silverDeps: string[];
   goldDeps: string[];
   status: GoldStatus;
-  run: { status: StageStatus | 'blocked'; error?: string; detail?: { dependency: string; reason: string }[]; active?: boolean } | null;
+  run: { status: StageStatus | 'blocked'; error?: string; detail?: { dependency: string; reason: string }[]; active?: boolean;
+    attempt?: number; maxAttempts?: number; executionId?: string; skipped?: boolean } | null;
 }
-export interface LakeState { datasets: DatasetState[]; gold: GoldState[]; running: boolean; ready: boolean }
+export interface QueueDepth { visible: number; inFlight: number; delayed: number; error?: boolean }
+export interface LakeState {
+  datasets: DatasetState[]; gold: GoldState[]; running: boolean; ready: boolean; mode: PipelineMode;
+  queues: Record<'events' | 'retry' | 'dlq', QueueDepth>;
+  schedule: { everyMinutes: number; lastRun: { executionArn: string; status: string; startDate: string; stopDate?: string } | null };
+  runningMachines: Record<'datasets' | 'gold' | 'scheduled', boolean>;
+}
+export interface FeedEvent { ts: number; level: 'info' | 'ok' | 'wait' | 'error'; kind: string; target: string; text: string; trace?: string; attempt?: number }
+export interface StoragePrefix { prefix: string; depth: number; files: number; bytes: number; lastModified: string | null }
+export interface StorageBucket { label: string; bucket: string; files: number; bytes: number; prefixes: StoragePrefix[] }
 
 export interface QueryResult {
   columns: string[];
@@ -113,6 +135,13 @@ export const api = {
   startGold: (models: string[] = []) =>
     call<{ executionArn: string; models: string[] }>('POST', '/pipeline/start', { kind: 'gold', models }),
   reset: (includeLanding: boolean) => call<Record<string, unknown>>('POST', '/reset', { includeLanding }),
+  setMode: (mode: PipelineMode) => call<{ mode: PipelineMode; resentEvents: string[] }>('POST', '/mode', { mode }),
+  events: () => call<{ events: FeedEvent[] }>('GET', '/events'),
+  storage: () => call<{ buckets: StorageBucket[]; generatedAt: string }>('GET', '/storage'),
+  restore: (dataset = 'all') => call<{ restored: { file: string; from: string }[]; missing: string[] }>('POST', '/landing/restore', { dataset }),
+  simulateMissing: (filename: string) => call<{ sent: string }>('POST', '/events/simulate', { filename }),
+  redriveDlq: () => call<{ messages: number }>('POST', '/dlq/redrive'),
+  runSchedule: () => call<{ executionArn: string }>('POST', '/schedule/run'),
   query: (sql: string) => call<QueryResult>('POST', '/query', { sql }),
   costs: (range: '24h' | '7d' | '30d') => call<CostReport>('GET', `/costs?range=${range}`),
   logs: (p: { source: string; minutes: number; level: string; q?: string }) =>

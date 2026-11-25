@@ -9,6 +9,11 @@
 # Uso:
 #   ./deplo.sh              Despliega todo (equivale a "deploy")
 #   ./deplo.sh seed         Sube los CSV de sample-data/ al bucket landing
+#                           (en modo event-driven, ESO SOLO dispara todo el pipeline)
+#   ./deplo.sh mode [event|scheduled]
+#                           Muestra o cambia el modo: event-driven (S3 → SQS → Lambda)
+#                           o programado (EventBridge cada 30 min → Step Functions)
+#   ./deplo.sh schedule     (modo programado) ejecuta ya el flujo programado y espera
 #   ./deplo.sh run [dataset] [modo]
 #                           Procesa archivos y espera el resultado. Sin argumentos procesa TODOS
 #                           en orden de dependencias. Con dataset: modo "single" (default; falla si
@@ -16,6 +21,7 @@
 #                           Ej.: ./deplo.sh run products               -> falla sin product_subcategories
 #                                ./deplo.sh run products with_dependencies
 #   ./deplo.sh gold         Construye los modelos Gold (exige Silver al día) y espera
+#                           (run y gold son del modo programado: Step Functions a mano)
 #   ./deplo.sh reset        Vacía bronze/silver/gold + tablas (conserva los CSV)
 #   ./deplo.sh reset-all    Igual que reset pero también vacía landing
 #   ./deplo.sh destroy      Elimina TODA la infraestructura (cdk destroy)
@@ -211,8 +217,30 @@ wait_execution() {  # uso: wait_execution <state-machine-arn> <json-input>
   fi
 }
 
+MODE_PARAM="/datalake-demo/pipeline-mode"
+current_mode() { aws ssm get-parameter --name "$MODE_PARAM" --query Parameter.Value --output text; }
+require_scheduled() {
+  [ "$(current_mode)" = "scheduled" ] || fail "El modo actual es event-driven: los archivos se procesan solos al llegar. Usa './deplo.sh mode scheduled' para ejecutar Step Functions a mano."
+}
+
+cmd_mode() {
+  check_prereqs
+  if [ -z "${1:-}" ]; then echo "Modo actual: $(current_mode)"; return; fi
+  [ "$1" = "event" ] || [ "$1" = "scheduled" ] || fail "Modo inválido: usa event o scheduled"
+  aws ssm put-parameter --name "$MODE_PARAM" --value "$1" --type String --overwrite >/dev/null
+  echo "Modo cambiado a: $1"
+  [ "$1" = "event" ] && echo "Tip: los archivos que estén en landing no generan evento solos; usa la web (cambiar de modo re-emite sus eventos) o './deplo.sh seed'."
+}
+
+cmd_schedule() {
+  check_prereqs
+  require_scheduled
+  wait_execution "$(output "$S_PIPE" ScheduledStateMachineArn)" '{"manual": true}' || fail "El flujo programado terminó con error"
+}
+
 cmd_run() {  # uso: run [dataset|all] [single|with_dependencies]
   check_prereqs
+  require_scheduled
   local input
   input="$("$VENV/bin/python" scripts/plan_input.py "${1:-all}" "${2:-single}")" || fail "Argumentos inválidos"
   wait_execution "$(output "$S_PIPE" DatasetStateMachineArn)" "$input" || fail "El pipeline de datasets terminó con error"
@@ -220,7 +248,8 @@ cmd_run() {  # uso: run [dataset|all] [single|with_dependencies]
 
 cmd_gold() {
   check_prereqs
-  wait_execution "$(output "$S_PIPE" GoldStateMachineArn)" '{"models": []}' || fail "El pipeline Gold terminó con error"
+  require_scheduled
+  wait_execution "$(output "$S_PIPE" GoldStateMachineArn)" '{"models": [], "onlyStale": false, "onlyReady": false}' || fail "El pipeline Gold terminó con error"
 }
 
 cmd_reset() {  # $1 = true|false (incluir landing)
@@ -251,7 +280,7 @@ cmd_deploy() {
   log "Listo ✔"
   echo "Web : $(output "$S_WEB" WebUrl)"
   echo "API : $(output "$S_API" ApiUrl)"
-  echo "Siguiente paso: ./deplo.sh seed && ./deplo.sh run && ./deplo.sh gold   (o súbelos y procésalos desde la web)"
+  echo "Modo: $(current_mode). Siguiente paso: ./deplo.sh seed (event-driven procesa todo solo) o súbelos desde la web"
 }
 
 case "${1:-deploy}" in
@@ -259,6 +288,8 @@ case "${1:-deploy}" in
   seed)      cmd_seed ;;
   run)       shift; cmd_run "$@" ;;
   gold)      cmd_gold ;;
+  mode)      shift; cmd_mode "$@" ;;
+  schedule)  cmd_schedule ;;
   reset)     cmd_reset false ;;
   reset-all) cmd_reset true ;;
   destroy)   cmd_destroy ;;

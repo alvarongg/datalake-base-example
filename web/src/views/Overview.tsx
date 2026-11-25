@@ -18,32 +18,67 @@ const edge = (id: string, source: string, target: string, label?: string, extra:
 });
 const svc = (id: string, x: number, y: number, data: ServiceNodeData): Node => ({ id, type: 'service', position: { x, y }, data });
 
-/* Arquitectura completa: del navegador a Athena. */
+/* Arquitectura completa: acceso, los DOS orquestadores (event-driven y programado), el lake y la plataforma. */
+const zone = (id: string, x: number, y: number, w: number, h: number, title: string, tint?: string): Node =>
+  ({ id, type: 'zone', position: { x, y }, data: { title, w, h, tint }, selectable: false, draggable: false, zIndex: -1 });
+
 function useArchitecture() {
   return useMemo(() => {
     const nodes: Node[] = [
-      { id: 'g-front', type: 'zone', position: { x: 220, y: 0 }, data: { title: 'Front-end y acceso', w: 540, h: 400 }, selectable: false, draggable: false, zIndex: -1 },
-      { id: 'g-lake', type: 'zone', position: { x: 800, y: 0 }, data: { title: 'Pipelines y data lake', w: 820, h: 400 }, selectable: false, draggable: false, zIndex: -1 },
-      svc('user', 0, 170, { title: 'Ingeniero', subtitle: 'Navegador web', tone: 'neutral' }),
-      svc('cf', 250, 60, { icon: 'cloudfront', title: 'CloudFront + S3', subtitle: 'Sirve la web (HTTPS)' }),
-      svc('cognito', 250, 290, { icon: 'cognito', title: 'Cognito', subtitle: 'Login SRP · emite el JWT' }),
-      svc('apigw', 510, 170, { icon: 'apiGateway', title: 'API Gateway', subtitle: 'Valida el JWT' }),
-      svc('lambda', 830, 170, { icon: 'lambda', title: 'Lambdas de API', subtitle: 'Estado, costos, logs' }),
-      svc('landing', 1110, 60, { icon: 's3', title: 'S3 landing', subtitle: 'CSV por URL prefirmada', tone: 'landing' }),
-      svc('sfn', 1110, 170, { icon: 'stepFunctions', title: 'Step Functions', subtitle: 'Un pipeline por archivo' }),
-      svc('athena', 1110, 290, { icon: 'athena', title: 'Athena', subtitle: 'Consultas SQL', tone: 'athena' }),
-      svc('glue', 1370, 170, { icon: 'glue', title: 'Glue Catalog + Spark', subtitle: 'Tablas y job Silver' }),
+      zone('z-sec', 0, -190, 2240, 150, 'Plataforma: infraestructura como código, seguridad y monitoreo'),
+      zone('z-front', 0, 0, 800, 470, 'Acceso de los ingenieros'),
+      zone('z-evt', 840, 0, 870, 270, 'Arquitectura event-driven (modo "event")', 'color-mix(in oklch, var(--accent) 7%, transparent)'),
+      zone('z-sch', 840, 300, 870, 170, 'Arquitectura programada (modo "scheduled")', 'color-mix(in oklch, var(--warning) 6%, transparent)'),
+      zone('z-lake', 1750, 0, 490, 470, 'Data lake'),
+      // plataforma
+      svc('cdk', 20, -140, { icon: 'cdk', title: 'AWS CDK (Python)', subtitle: 'Crea TODO esto desde código (deplo.sh)' }),
+      svc('iam', 470, -140, { icon: 'iam', title: 'IAM', subtitle: 'Un rol por función, permisos mínimos' }),
+      svc('kms', 920, -140, { icon: 'kms', title: 'KMS', subtitle: 'En producción: clave propia (CMK)', dashed: true, badge: 'no desplegado: SSE-S3/SSE-SQS sin costo' }),
+      svc('ssm', 1370, -140, { icon: 'ssm', title: 'SSM Parameter Store', subtitle: 'Guarda el modo: event | scheduled' }),
+      svc('cw', 1820, -140, { icon: 'cloudwatch', title: 'CloudWatch', subtitle: 'Logs, métricas y costos' }),
+      // acceso
+      svc('user', 20, 200, { title: 'Ingeniero', subtitle: 'Navegador web', tone: 'neutral' }),
+      svc('cf', 290, 60, { icon: 'cloudfront', title: 'CloudFront + S3', subtitle: 'Sirve la web (HTTPS)' }),
+      svc('cognito', 290, 350, { icon: 'cognito', title: 'Cognito', subtitle: 'Login SRP · emite el JWT' }),
+      svc('apigw', 290, 200, { icon: 'apiGateway', title: 'API Gateway', subtitle: 'Valida el JWT' }),
+      svc('api', 560, 200, { icon: 'lambda', title: 'Lambdas de API', subtitle: 'Estado, costos, logs, modo' }),
+      // event-driven
+      svc('landing', 870, 60, { icon: 's3', title: 'S3 landing', subtitle: 'PUT de un CSV = evento', tone: 'landing' }),
+      svc('q', 1170, 60, { icon: 'sqs', title: 'SQS events', subtitle: 'Cola de eventos del pipeline' }),
+      svc('disp', 1460, 60, { icon: 'lambda', title: 'Lambda despachador', subtitle: '¿se cumplen las condiciones?' }),
+      svc('retry', 1170, 180, { icon: 'sqs', title: 'SQS retry-dlq', subtitle: 'Espera 20 s y vuelve a probar' }),
+      svc('dlq', 1460, 180, { icon: 'sqs', title: 'SQS dead-letter', subtitle: 'Errores y 15 intentos agotados', tone: 'neutral' }),
+      svc('ebglue', 870, 180, { icon: 'eventbridge', title: 'EventBridge', subtitle: 'Avisa cuando termina Glue' }),
+      // programado
+      svc('ebsch', 870, 360, { icon: 'eventbridge', title: 'EventBridge (regla)', subtitle: 'Cada 30 minutos' }),
+      svc('sfn', 1170, 360, { icon: 'stepFunctions', title: 'Step Functions', subtitle: 'Plan → datasets → Gold' }),
+      svc('lambdas', 1460, 360, { icon: 'lambda', title: 'Lambdas por capa', subtitle: 'El MISMO código que event-driven' }),
+      // lake
+      svc('layers', 1790, 60, { icon: 's3', title: 'S3 bronze · silver · gold', subtitle: 'Un bucket por capa', tone: 'gold' }),
+      svc('gluejob', 1790, 200, { icon: 'glue', title: 'Glue Spark + Catalog', subtitle: 'Silver de hechos · tablas' }),
+      svc('athena', 1790, 350, { icon: 'athena', title: 'Athena', subtitle: 'Gold (CTAS) y consultas', tone: 'athena' }),
     ];
+    const dash = { style: { strokeDasharray: '5 4' } };
     const edges: Edge[] = [
-      edge('e1', 'user', 'cf', 'descarga la web', { sourceHandle: 's-Top', targetHandle: 't-Left' }),
-      edge('e2', 'user', 'cognito', 'login', { sourceHandle: 's-Bottom', targetHandle: 't-Left' }),
-      edge('e3', 'user', 'apigw', 'API + JWT', { sourceHandle: 's-Right', targetHandle: 't-Left' }),
-      edge('e4', 'cognito', 'apigw', 'valida JWT', { sourceHandle: 's-Right', targetHandle: 't-Bottom', animated: true }),
-      edge('e5', 'apigw', 'lambda', undefined, { sourceHandle: 's-Right', targetHandle: 't-Left' }),
-      edge('e6', 'lambda', 'landing', 'URL prefirmada', { sourceHandle: 's-Top', targetHandle: 't-Left' }),
-      edge('e7', 'lambda', 'sfn', 'inicia', { sourceHandle: 's-Right', targetHandle: 't-Left' }),
-      edge('e8', 'lambda', 'athena', 'SELECT', { sourceHandle: 's-Bottom', targetHandle: 't-Left' }),
-      edge('e9', 'sfn', 'glue', undefined, { sourceHandle: 's-Right', targetHandle: 't-Left' }),
+      edge('a1', 'user', 'cf', 'descarga la web', { sourceHandle: 's-Top', targetHandle: 't-Left' }),
+      edge('a2', 'user', 'cognito', 'login', { sourceHandle: 's-Bottom', targetHandle: 't-Left' }),
+      edge('a3', 'user', 'apigw', 'API + JWT', { sourceHandle: 's-Right', targetHandle: 't-Left' }),
+      edge('a4', 'apigw', 'api', undefined, { sourceHandle: 's-Right', targetHandle: 't-Left' }),
+      edge('a5', 'api', 'landing', 'URL prefirmada', { sourceHandle: 's-Top', targetHandle: 't-Left' }),
+      edge('e1', 'landing', 'q', 'S3 PUT event', { sourceHandle: 's-Right', targetHandle: 't-Left', animated: true }),
+      edge('e2', 'q', 'disp', 'dispara', { sourceHandle: 's-Right', targetHandle: 't-Left', animated: true }),
+      edge('e3', 'disp', 'retry', 'faltan dependencias', { sourceHandle: 's-Bottom', targetHandle: 't-Right', ...dash }),
+      edge('e4', 'retry', 'disp', '20 s', { sourceHandle: 's-Top', targetHandle: 't-Bottom', ...dash }),
+      edge('e5', 'disp', 'dlq', 'error', { sourceHandle: 's-Bottom', targetHandle: 't-Top', ...dash }),
+      edge('e6', 'ebglue', 'q', 'fin de Glue', { sourceHandle: 's-Right', targetHandle: 't-Bottom' }),
+      edge('e7', 'disp', 'layers', 'ejecuta el paso', { sourceHandle: 's-Right', targetHandle: 't-Left' }),
+      edge('s1', 'ebsch', 'sfn', 'cron', { sourceHandle: 's-Right', targetHandle: 't-Left' }),
+      edge('s2', 'sfn', 'lambdas', undefined, { sourceHandle: 's-Right', targetHandle: 't-Left' }),
+      edge('s3', 'lambdas', 'layers', undefined, { sourceHandle: 's-Right', targetHandle: 't-Bottom' }),
+      edge('l1', 'layers', 'gluejob', undefined, { sourceHandle: 's-Bottom', targetHandle: 't-Top' }),
+      edge('l2', 'gluejob', 'athena', undefined, { sourceHandle: 's-Bottom', targetHandle: 't-Top' }),
+      edge('p1', 'cdk', 'iam', 'despliega', { sourceHandle: 's-Right', targetHandle: 't-Left', ...dash }),
+      edge('p2', 'ssm', 'disp', 'modo', { sourceHandle: 's-Bottom', targetHandle: 't-Top', ...dash }),
     ];
     return { nodes, edges };
   }, []);
@@ -127,9 +162,9 @@ export default function Overview() {
       </div>
 
       <Card>
-        <CardHeader><CardTitle>2 · Cómo se conecta todo</CardTitle>
-          <CardDescription>El ingeniero descarga la web desde CloudFront, inicia sesión en Cognito y llama a la API con el JWT. Los CSV viajan directo del navegador a S3.</CardDescription></CardHeader>
-        <CardContent><Diagram nodes={arch.nodes} edges={arch.edges} height={440} /></CardContent>
+        <CardHeader><CardTitle>2 · Arquitectura completa</CardTitle>
+          <CardDescription>Arriba la plataforma (CDK, IAM, KMS, SSM, CloudWatch). Al centro los DOS orquestadores que se pueden alternar en Operar: event-driven (cada archivo dispara su pipeline por SQS) y programado (EventBridge cada 30 min dispara Step Functions). Ambos ejecutan el mismo código sobre el mismo lake.</CardDescription></CardHeader>
+        <CardContent><Diagram nodes={arch.nodes} edges={arch.edges} height={640} /></CardContent>
       </Card>
 
       <Card>

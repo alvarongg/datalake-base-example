@@ -40,6 +40,25 @@ def test_status_progression_for_a_root_table():
     assert dataset_status(CATEGORIES, v, {"product_categories": ctl()}) == "ok"
 
 
+def test_archived_file_keeps_the_table_up_to_date():
+    # Tras Bronze el CSV se mueve a archive/: sin archivo en landing la tabla sigue al día.
+    assert dataset_status(CATEGORIES, None, {"product_categories": ctl()}) == "ok"
+    assert dataset_status(CATEGORIES, None, {"product_categories": ctl(with_silver=False)}) == "bronze"
+
+
+def test_gold_only_stale_skips_up_to_date_models_unless_a_parent_is_rebuilt():
+    from lambdas.gold.handler import plan_models
+
+    models = load_models()
+    all_ok = {d.name: "ok" for d in DATASETS}
+    gold = {m.name: "ok" for m in models}
+    gold["fact_sales"] = "stale"
+    to_build, blocked, skipped = plan_models([], models, all_ok, gold, only_stale=True)
+    built = [m.name for m in to_build]
+    assert "fact_sales" in built and "sales_monthly_by_category" in built  # el agregado depende de fact_sales
+    assert "dim_customer" in skipped and not blocked
+
+
 def test_new_file_makes_silver_stale():
     assert dataset_status(CATEGORIES, "v2", {"product_categories": ctl("v1")}) == "stale"
 
@@ -106,12 +125,12 @@ def test_gold_plan_builds_in_order_and_blocks_the_dependents():
 
     models = load_models()
     all_ok = {d.name: "ok" for d in DATASETS}
-    to_build, blocked = plan_models([], models, all_ok, {m.name: "not_built" for m in models})
+    to_build, blocked, _ = plan_models([], models, all_ok, {m.name: "not_built" for m in models})
     assert [m.name for m in to_build] == [m.name for m in models] and not blocked
 
     # products desactualizada: dim_product, fact_sales, fact_returns y todo lo que cuelga de ellos quedan bloqueados.
     stale = {**all_ok, "products": "stale"}
-    to_build, blocked = plan_models([], models, stale, {m.name: "not_built" for m in models})
+    to_build, blocked, _ = plan_models([], models, stale, {m.name: "not_built" for m in models})
     assert "dim_product" in blocked and "fact_sales" in blocked and "sales_monthly_by_category" in blocked
     assert "dim_customer" not in blocked and "dim_customer" in [m.name for m in to_build]
 
@@ -121,10 +140,10 @@ def test_gold_single_model_requires_its_gold_parents_to_exist():
 
     models = load_models()
     all_ok = {d.name: "ok" for d in DATASETS}
-    _, blocked = plan_models(["sales_monthly_by_category"], models, all_ok, {m.name: "not_built" for m in models})
+    _, blocked, _ = plan_models(["sales_monthly_by_category"], models, all_ok, {m.name: "not_built" for m in models})
     assert "sales_monthly_by_category" in blocked
     ok_gold = {m.name: ("ok" if m.name != "sales_monthly_by_category" else "not_built") for m in models}
-    to_build, blocked = plan_models(["sales_monthly_by_category"], models, all_ok, ok_gold)
+    to_build, blocked, _ = plan_models(["sales_monthly_by_category"], models, all_ok, ok_gold)
     assert [m.name for m in to_build] == ["sales_monthly_by_category"] and not blocked
 
 

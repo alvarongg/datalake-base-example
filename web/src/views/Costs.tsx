@@ -13,7 +13,7 @@ import { fmtNum, fmtTime, usd } from '@/lib/utils';
 
 const RANGES = [['24h', 'Últimas 24 h'], ['7d', 'Últimos 7 días'], ['30d', 'Últimos 30 días']] as const;
 const ICON: Record<string, AwsService | undefined> = {
-  lambda: 'lambda', glue: 'glue', athena: 'athena', stepfunctions: 'stepFunctions', s3: 's3', apigateway: 'apiGateway', cloudfront: 'cloudfront', cognito: 'cognito',
+  lambda: 'lambda', glue: 'glue', athena: 'athena', stepfunctions: 'stepFunctions', s3: 's3', apigateway: 'apiGateway', cloudfront: 'cloudfront', cognito: 'cognito', sqs: 'sqs', eventbridge: 'eventbridge', logs: 'cloudwatch',
 };
 const DETAIL_COLS: Record<string, [string, string][]> = {
   lambda: [['label', 'Función'], ['invocations', 'Invocaciones'], ['durationSeconds', 'Segundos'], ['memoryMb', 'Memoria (MB)'], ['cost', 'Costo']],

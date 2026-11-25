@@ -2,13 +2,18 @@
 
 Rutas (todas exigen un token de Cognito, lo valida API Gateway antes de llegar aquí):
 
-  GET  /state             -> estado de cada dataset y modelo Gold (qué está al día,
-                             qué falta, qué se está procesando ahora)
-  POST /upload-url        -> URL prefirmada para subir UN csv directo a S3
-  POST /pipeline/start    -> inicia un pipeline: de un dataset (solo o con sus
-                             dependencias), de todos, o la construcción de Gold
-  POST /reset             -> borra bronze/silver/gold (y landing si se pide)
-  POST /query             -> SELECT de solo lectura en Athena
+  GET  /state               -> estado de datasets, modelos Gold, modo, colas y programación
+  GET  /events              -> feed de decisiones del despachador event-driven
+  GET  /storage             -> cantidad de archivos y peso por ruta de cada bucket
+  POST /mode                -> cambia entre event-driven y programado
+  POST /upload-url          -> URL prefirmada para subir UN csv directo a S3
+  POST /landing/restore     -> devuelve a landing la última versión archivada (dispara eventos reales de S3)
+  POST /events/simulate     -> manda un evento de S3 de un archivo que NO está (demuestra el error)
+  POST /dlq/redrive         -> reenvía los mensajes de la DLQ final a la cola principal
+  POST /pipeline/start      -> (modo programado) ejecuta Step Functions de datasets o de Gold
+  POST /schedule/run        -> (modo programado) ejecuta ya el flujo programado completo
+  POST /reset               -> borra bronze/silver/gold (y landing si se pide)
+  POST /query               -> SELECT de solo lectura en Athena
 
 Los CSV nunca pasan por la API ni por Lambda: el navegador los sube directo a
 S3 con la URL prefirmada. Así no hay límite de 6 MB y no se paga cómputo.
@@ -20,15 +25,17 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import boto3
 from botocore.config import Config
 
 from common.control import ControlStore
-from common.datasets import (
-    ALLOWED_FILES, DATASETS, DATASETS_BY_NAME, all_in_order, dependency_closure, required_files,
-)
+from common.datasets import ALLOWED_FILES, DATASETS, DATASETS_BY_NAME, all_in_order, dependency_closure
+from common.events import ARCHIVE_PREFIX, latest_archived
 from common.gold_models import load_models
+from common.mode import MODES, get_mode, set_mode
 from common.progress import PREFIX as PROGRESS_PREFIX
 from common.settings import DATASET_PREFIX, get_settings
 from common.sql_guard import UnsafeSqlError, validate_select
@@ -41,10 +48,13 @@ _s3 = boto3.client("s3", config=Config(signature_version="s3v4"))
 _sfn = boto3.client("stepfunctions")
 _athena = boto3.client("athena")
 _lambda = boto3.client("lambda")
+_sqs = boto3.client("sqs")
 
 UPLOAD_URL_TTL_SECONDS = 300
 MAX_ROWS = 100
 QUERY_TIMEOUT_SECONDS = 22  # API Gateway corta a los 29 s
+EVENT_RUN_IDLE_SECONDS = 15 * 60  # una corrida event-driven sin novedades en 15 min se da por abandonada
+SCHEDULE_MINUTES = int(os.environ.get("SCHEDULE_MINUTES", "30"))
 
 
 class HttpError(Exception):
@@ -63,6 +73,10 @@ def _json_body(event) -> dict:
         return json.loads(event.get("body") or "{}")
     except json.JSONDecodeError as exc:
         raise HttpError(400, "El cuerpo debe ser JSON válido.") from exc
+
+
+def _env(name: str) -> str:
+    return os.environ[name]
 
 
 # ------------------------------------------------------------ ejecuciones
@@ -93,94 +107,206 @@ def _execution_outcome(execution_arn: str) -> tuple[str, str | None]:
     return ex["status"], cause
 
 
-# --------------------------------------------------------------- progreso
-
-
-def _read_progress_docs() -> dict[str, dict]:
-    bucket = get_settings().athena_results_bucket
-    docs = {}
-    for name in [d.name for d in DATASETS] + ["gold"]:
+def _outcome(execution_id: str, updated_at: float, outcomes: dict) -> tuple[str, str | None]:
+    """Estado de la corrida que escribió un documento de progreso (Step Functions o event-driven)."""
+    if execution_id.startswith("evt:"):
+        # Event-driven no tiene un "estado de ejecución" central: se infiere por actividad reciente.
+        # Sin novedades en 15 min y sin etapa fallida: quedó sin cerrar (p. ej. un evento repetido). No es un fallo.
+        idle = time.time() - (updated_at or 0) > EVENT_RUN_IDLE_SECONDS
+        return ("ABANDONED", None) if idle else ("RUNNING", None)
+    if execution_id not in outcomes:
         try:
-            docs[name] = json.loads(_s3.get_object(Bucket=bucket, Key=f"{PROGRESS_PREFIX}/{name}.json")["Body"].read())
-        except _s3.exceptions.NoSuchKey:
-            continue
-        except Exception:  # noqa: BLE001 - el progreso es opcional
-            logger.warning("No se pudo leer el progreso de %s", name, exc_info=True)
-    return docs
+            outcomes[execution_id] = _execution_outcome(execution_id)
+        except Exception:  # noqa: BLE001
+            outcomes[execution_id] = ("UNKNOWN", None)
+    return outcomes[execution_id]
+
+
+def _get_json(bucket: str, key: str):
+    try:
+        return json.loads(_s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+    except _s3.exceptions.NoSuchKey:
+        return None
+    except Exception:  # noqa: BLE001 - el progreso es opcional
+        logger.warning("No se pudo leer %s", key, exc_info=True)
+        return None
 
 
 def _reconcile_dataset_run(doc: dict, outcomes: dict) -> dict:
-    """Si la ejecución terminó pero alguna etapa quedó 'running' (p. ej. timeout), la marca como fallida."""
+    """Une el documento de progreso con el estado real de su ejecución."""
     stages = doc["stages"]
-    unfinished = any(s["status"] in ("running", "pending") for s in stages.values())
-    run_status = "RUNNING"
-    if any(s["status"] == "failed" for s in stages.values()):
-        run_status = "FAILED"  # una etapa ya informó su fallo: no hace falta consultar Step Functions
+    statuses = [s["status"] for s in stages.values()]
+    unfinished = any(s in ("running", "pending", "waiting") for s in statuses)
+    if "failed" in statuses:
+        run_status = "FAILED"
     elif unfinished:
-        arn = doc["executionId"]
-        if arn not in outcomes:
-            try:
-                outcomes[arn] = _execution_outcome(arn)
-            except Exception:  # noqa: BLE001
-                outcomes[arn] = ("UNKNOWN", None)
-        run_status, cause = outcomes[arn]
+        run_status, cause = _outcome(doc.get("executionId") or "", doc.get("updatedAt", 0), outcomes)
+        if run_status == "ABANDONED":
+            return {"runStatus": "ABANDONED", "stages": stages}
         if run_status != "RUNNING":
             for s in stages.values():
-                if s["status"] == "running":
+                if s["status"] in ("running", "waiting"):
                     s.update(status="failed", error=cause or run_status)
+            run_status = "FAILED" if run_status != "SUCCEEDED" else "SUCCEEDED"
     else:
-        run_status = "FAILED" if any(s["status"] == "failed" for s in stages.values()) else "SUCCEEDED"
-    return {"executionId": doc.get("executionId"), "runStatus": run_status, "stages": stages,
+        run_status = "SUCCEEDED"
+    exec_id = doc.get("executionId") or ""
+    return {"executionId": exec_id, "orchestrator": "event" if exec_id.startswith("evt:") else "stepfunctions",
+            "runStatus": run_status, "stages": stages, "updatedAt": doc.get("updatedAt"),
             "queued": run_status == "RUNNING" and all(s["status"] == "pending" for s in stages.values())}
+
+
+def _queues() -> dict:
+    """Profundidad de las 3 colas: visibles, en proceso y demoradas (esperando sus 20 s)."""
+    out = {}
+    for key, env in (("events", "EVENTS_QUEUE_URL"), ("retry", "RETRY_QUEUE_URL"), ("dlq", "DLQ_URL")):
+        try:
+            attrs = _sqs.get_queue_attributes(QueueUrl=_env(env), AttributeNames=[
+                "ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessagesDelayed"])["Attributes"]
+            out[key] = {"visible": int(attrs["ApproximateNumberOfMessages"]), "inFlight": int(attrs["ApproximateNumberOfMessagesNotVisible"]),
+                        "delayed": int(attrs["ApproximateNumberOfMessagesDelayed"]), "url": _env(env)}
+        except Exception:  # noqa: BLE001
+            logger.warning("No se pudo leer la cola %s", key, exc_info=True)
+            out[key] = {"visible": 0, "inFlight": 0, "delayed": 0, "error": True}
+    return out
+
+
+def _schedule() -> dict:
+    arn = _env("SCHEDULED_STATE_MACHINE_ARN")
+    last = _sfn.list_executions(stateMachineArn=arn, maxResults=1)["executions"]
+    return {"everyMinutes": SCHEDULE_MINUTES, "lastRun": last[0] if last else None}
 
 
 def get_state(event):
     settings = get_settings()
     state = ControlStore(settings, _s3).load()
-    docs = _read_progress_docs()
+    bucket = settings.athena_results_bucket
+    models = load_models()
+    with ThreadPoolExecutor(10) as pool:
+        ds_docs = dict(zip([d.name for d in DATASETS], pool.map(lambda d: _get_json(bucket, f"{PROGRESS_PREFIX}/{d.name}.json"), DATASETS)))
+        gold_docs = dict(zip([m.name for m in models], pool.map(lambda m: _get_json(bucket, f"{PROGRESS_PREFIX}/gold/{m.name}.json"), models)))
+        queues_f = pool.submit(_queues)
+        schedule_f = pool.submit(_schedule)
+        mode_f = pool.submit(get_mode, None, False)
+        running_f = {k: pool.submit(_running, _env(env)) for k, env in (
+            ("datasets", "DATASET_STATE_MACHINE_ARN"), ("gold", "GOLD_STATE_MACHINE_ARN"), ("scheduled", "SCHEDULED_STATE_MACHINE_ARN"))}
     outcomes: dict = {}
 
     datasets = []
     for d in DATASETS:
         ctl = state.controls.get(d.name) or {}
-        doc = docs.get(d.name)
+        doc = ds_docs.get(d.name)
         run = _reconcile_dataset_run(doc, outcomes) if doc else None
-        if run and run["runStatus"] not in ("RUNNING",) and all(
-                s["status"] == "pending" for s in run["stages"].values()):
+        if run and (run["runStatus"] == "ABANDONED"
+                    or (run["runStatus"] != "RUNNING" and all(s["status"] == "pending" for s in run["stages"].values()))):
             run = None  # estuvo en cola y la ejecución se cortó: no hay nada que mostrar
+        bronze = ctl.get("bronze") or {}
         datasets.append({
             "name": d.name, "description": d.description, "engine": d.silver_engine,
             "dependsOn": list(d.depends_on),
-            "files": [{"name": f, "uploaded": f in state.landing, "size": (state.landing.get(f) or {}).get("size")}
-                      for f in d.files],
+            "files": [{"name": f, "uploaded": f in state.landing, "size": (state.landing.get(f) or {}).get("size")} for f in d.files],
             "status": state.statuses[d.name],
-            "rows": {"bronze": (ctl.get("bronze") or {}).get("rows"), "silver": (ctl.get("silver") or {}).get("rows")},
+            "rows": {"bronze": bronze.get("rows"), "silver": (ctl.get("silver") or {}).get("rows")},
+            "lastBronzeAt": bronze.get("at"), "archived": bronze.get("archived", []),
             "run": run,
         })
 
-    gold_doc = docs.get("gold")
-    gold_run = {t["name"]: t for t in (gold_doc or {}).get("tables", [])}
-    gold_alive = None
-    if gold_doc and any(t["status"] in ("pending", "running") for t in gold_run.values()):
-        arn = gold_doc["executionId"]
-        try:
-            outcomes[arn] = outcomes.get(arn) or _execution_outcome(arn)
-        except Exception:  # noqa: BLE001
-            outcomes[arn] = ("UNKNOWN", None)
-        gold_alive = outcomes[arn][0] == "RUNNING"
-        if not gold_alive:
-            for t in gold_run.values():
-                if t["status"] == "running":
-                    t.update(status="failed", error=outcomes[arn][1] or outcomes[arn][0])
-    gold = [{"name": m.name, "silverDeps": list(m.silver_deps), "goldDeps": list(m.gold_deps),
-             "status": state.gold_statuses[m.name],
-             "run": ({**gold_run[m.name], "active": gold_alive} if m.name in gold_run and
-                     (gold_alive or gold_run[m.name]["status"] != "pending") else None)}
-            for m in load_models()]
+    gold = []
+    for m in models:
+        doc = gold_docs.get(m.name)
+        run = None
+        if doc:
+            active = doc["status"] in ("pending", "running", "waiting")
+            if active:
+                st, cause = _outcome(doc.get("executionId") or "", doc.get("updatedAt", 0), outcomes)
+                if st == "ABANDONED":
+                    doc = None
+                elif st != "RUNNING":
+                    doc = {**doc, "status": "failed" if doc["status"] != "pending" else "pending", "error": cause or st}
+                    active = False
+            if doc and (active or doc["status"] != "pending"):
+                run = {**doc, "active": active}
+        gold.append({"name": m.name, "silverDeps": list(m.silver_deps), "goldDeps": list(m.gold_deps),
+                     "status": state.gold_statuses[m.name], "run": run})
 
-    running = bool(_running(os.environ["DATASET_STATE_MACHINE_ARN"]) or _running(os.environ["GOLD_STATE_MACHINE_ARN"]))
-    return 200, {"datasets": datasets, "gold": gold, "running": running,
-                 "ready": all(f in state.landing for f in ALLOWED_FILES)}
+    queues = queues_f.result()
+    running_machines = {k: bool(f.result()) for k, f in running_f.items()}
+    queue_activity = sum(q["visible"] + q["inFlight"] + q["delayed"] for k, q in queues.items() if k != "dlq")
+    event_active = any(d["run"] and d["run"]["orchestrator"] == "event" and d["run"]["runStatus"] == "RUNNING" for d in datasets) \
+        or any(g["run"] and g["run"].get("active") for g in gold)
+    return 200, {
+        "datasets": datasets, "gold": gold, "mode": mode_f.result(), "queues": queues, "schedule": schedule_f.result(),
+        "runningMachines": running_machines,
+        "running": any(running_machines.values()) or queue_activity > 0 or event_active,
+        "ready": all(f in state.landing for f in ALLOWED_FILES),
+    }
+
+
+def get_events(event):
+    feed = _get_json(get_settings().athena_results_bucket, f"{PROGRESS_PREFIX}/events.json") or []
+    return 200, {"events": feed}
+
+
+def get_storage(event):
+    """Cantidad de archivos y peso por ruta (hasta 3 niveles) de cada bucket del lake."""
+    s = get_settings()
+    buckets = {"landing": s.landing_bucket, "bronze": s.bronze_bucket, "silver": s.silver_bucket,
+               "gold": s.gold_bucket, "athena-results": s.athena_results_bucket}
+
+    def scan(item):
+        label, name = item
+        prefixes: dict[str, dict] = {}
+        total = {"files": 0, "bytes": 0}
+        for page in _s3.get_paginator("list_objects_v2").paginate(Bucket=name, PaginationConfig={"MaxItems": 20000}):
+            for o in page.get("Contents", []):
+                parts = o["Key"].split("/")[:-1]
+                total["files"] += 1
+                total["bytes"] += o["Size"]
+                for depth in range(1, min(3, len(parts)) + 1):
+                    p = "/".join(parts[:depth]) + "/"
+                    e = prefixes.setdefault(p, {"prefix": p, "depth": depth, "files": 0, "bytes": 0, "lastModified": None})
+                    e["files"] += 1
+                    e["bytes"] += o["Size"]
+                    lm = o["LastModified"].isoformat()
+                    e["lastModified"] = max(e["lastModified"] or lm, lm)
+        return {"label": label, "bucket": name, **total, "prefixes": sorted(prefixes.values(), key=lambda e: e["prefix"])}
+
+    with ThreadPoolExecutor(5) as pool:
+        return 200, {"buckets": list(pool.map(scan, buckets.items())), "generatedAt": datetime.now(timezone.utc).isoformat()}
+
+
+# ----------------------------------------------------------------- modo
+
+
+def change_mode(event):
+    mode = _json_body(event).get("mode")
+    if mode not in MODES:
+        raise HttpError(400, f"mode debe ser uno de {', '.join(MODES)}.")
+    if any(_running(_env(e)) for e in ("DATASET_STATE_MACHINE_ARN", "GOLD_STATE_MACHINE_ARN", "SCHEDULED_STATE_MACHINE_ARN")):
+        raise HttpError(409, "Hay una ejecución de Step Functions en curso. Espera a que termine para cambiar de modo.")
+    set_mode(mode)
+    resent = []
+    if mode == "event":
+        # Los archivos que esperaban en landing (modo programado) se procesan ahora: se re-emite su evento.
+        landing = ControlStore(get_settings(), _s3).landing_objects()
+        for name, obj in landing.items():
+            if name in ALLOWED_FILES:
+                _sqs.send_message(QueueUrl=_env("EVENTS_QUEUE_URL"), MessageBody=_s3_event_body(name, obj["etag"], obj["size"]))
+                resent.append(name)
+    return 200, {"mode": mode, "resentEvents": resent}
+
+
+def _s3_event_body(filename: str, etag: str, size: int | None = None) -> str:
+    """Mismo formato que la notificación de S3, para que el despachador lo trate igual."""
+    return json.dumps({"Records": [{"eventName": "ObjectCreated:Put", "eventTime": datetime.now(timezone.utc).isoformat(),
+                                    "s3": {"bucket": {"name": get_settings().landing_bucket},
+                                           "object": {"key": f"{DATASET_PREFIX}/{filename}", "eTag": etag, "size": size}}}]})
+
+
+def _require_mode(expected: str) -> None:
+    if get_mode(use_cache=False) != expected:
+        other = "event-driven" if expected == "event" else "programado"
+        raise HttpError(409, f"Esta acción es del modo {other}. Cambia de modo en la pestaña Operar.")
 
 
 # ----------------------------------------------------------------- subida
@@ -200,6 +326,55 @@ def create_upload_url(event):
     return 200, {"url": url, "contentType": "text/csv", "expiresIn": UPLOAD_URL_TTL_SECONDS}
 
 
+def restore_from_archive(event):
+    """Copia a landing la última versión archivada de cada archivo pedido.
+
+    En modo event-driven cada copia genera un evento REAL de S3 → SQS → despachador.
+    """
+    dataset = _json_body(event).get("dataset", "all")
+    names = [d.name for d in DATASETS] if dataset == "all" else [dataset]
+    if any(n not in DATASETS_BY_NAME for n in names):
+        raise HttpError(400, f"Dataset desconocido: '{dataset}'.")
+    s = get_settings()
+    keys = [o["Key"] for page in _s3.get_paginator("list_objects_v2").paginate(Bucket=s.landing_bucket, Prefix=f"{ARCHIVE_PREFIX}/")
+            for o in page.get("Contents", [])]
+    latest = latest_archived(keys)
+    files = [f for n in names for f in DATASETS_BY_NAME[n].files]
+    missing = [f for f in files if f not in latest]
+    if missing and len(missing) == len(files):
+        raise HttpError(400, "No hay versiones archivadas de esos archivos. Súbelos en el Paso 1.", {"missingFiles": missing})
+    restored = []
+    for f in files:
+        if f in latest:
+            _s3.copy_object(Bucket=s.landing_bucket, Key=f"{DATASET_PREFIX}/{f}", CopySource={"Bucket": s.landing_bucket, "Key": latest[f]},
+                            MetadataDirective="REPLACE", ContentType="text/csv", Metadata={"restored-from": latest[f]})
+            restored.append({"file": f, "from": latest[f]})
+    return 200, {"restored": restored, "missing": missing}
+
+
+def simulate_missing(event):
+    """Evento de S3 de un archivo que NO está en landing: el despachador debe fallar y mandarlo a la DLQ final."""
+    _require_mode("event")
+    filename = _json_body(event).get("filename", "AdventureWorks_Products.csv")
+    if filename not in ALLOWED_FILES:
+        raise HttpError(400, f"Archivo no permitido: '{filename}'.")
+    landing = ControlStore(get_settings(), _s3).landing_objects()
+    if filename in landing:
+        raise HttpError(409, f"{filename} sí está en landing: elige uno que no esté para simular el error.")
+    _sqs.send_message(QueueUrl=_env("EVENTS_QUEUE_URL"), MessageBody=_s3_event_body(filename, "simulado-sin-archivo", 0))
+    return 202, {"sent": filename}
+
+
+def redrive_dlq(event):
+    """Reenvía la DLQ final a la cola principal (SQS StartMessageMoveTask: redrive nativo)."""
+    q = _queues()["dlq"]
+    if q["visible"] == 0:
+        raise HttpError(409, "La DLQ final está vacía.")
+    arn = lambda url: _sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]  # noqa: E731
+    task = _sqs.start_message_move_task(SourceArn=arn(_env("DLQ_URL")), DestinationArn=arn(_env("EVENTS_QUEUE_URL")))
+    return 202, {"taskHandle": task["TaskHandle"], "messages": q["visible"]}
+
+
 # ---------------------------------------------------------------- pipelines
 
 
@@ -216,12 +391,18 @@ def plan_dataset_run(dataset: str, mode: str) -> list[str]:
     raise HttpError(400, "mode debe ser 'single' o 'with_dependencies'.")
 
 
+def _busy() -> tuple[set[str], bool, bool]:
+    busy_datasets = {i["dataset"] for r in _running(_env("DATASET_STATE_MACHINE_ARN")) for i in r["input"].get("datasets", [])}
+    return busy_datasets, bool(_running(_env("GOLD_STATE_MACHINE_ARN"))), bool(_running(_env("SCHEDULED_STATE_MACHINE_ARN")))
+
+
 def start_pipeline(event):
+    _require_mode("scheduled")
     body = _json_body(event)
     kind = body.get("kind", "datasets")
-    ds_arn, gold_arn = os.environ["DATASET_STATE_MACHINE_ARN"], os.environ["GOLD_STATE_MACHINE_ARN"]
-    busy_datasets = {i["dataset"] for r in _running(ds_arn) for i in r["input"].get("datasets", [])}
-    gold_busy = bool(_running(gold_arn))
+    busy_datasets, gold_busy, scheduled_busy = _busy()
+    if scheduled_busy:
+        raise HttpError(409, "El flujo programado está en ejecución. Espera a que termine.")
 
     if kind == "gold":
         models = body.get("models") or []
@@ -230,7 +411,8 @@ def start_pipeline(event):
             raise HttpError(400, "Modelo Gold desconocido.")
         if busy_datasets or gold_busy:
             raise HttpError(409, "Hay pipelines en ejecución. Gold se construye cuando terminan.")
-        result = _sfn.start_execution(stateMachineArn=gold_arn, input=json.dumps({"models": models}))
+        result = _sfn.start_execution(stateMachineArn=_env("GOLD_STATE_MACHINE_ARN"),
+                                      input=json.dumps({"models": models, "onlyStale": False, "onlyReady": False}))
         return 202, {"executionArn": result["executionArn"], "models": models or sorted(known)}
 
     names = plan_dataset_run(body.get("dataset", ""), body.get("mode", "single"))
@@ -240,23 +422,36 @@ def start_pipeline(event):
     if clash:
         raise HttpError(409, f"Ya se está procesando: {', '.join(clash)}.")
 
-    # El sistema EXIGE que estén todos los archivos de lo que va a procesar.
-    landing = ControlStore(get_settings(), _s3).landing_objects()
-    missing = [f for f in required_files(names) if f not in landing]
+    # El sistema EXIGE los archivos de lo que nunca se cargó (lo ya cargado se reutiliza desde Bronze).
+    state = ControlStore(get_settings(), _s3).load()
+    missing = [f for n in names if state.statuses[n] == "no_file" for f in DATASETS_BY_NAME[n].files if f not in state.landing]
     if missing:
         raise HttpError(400, "Faltan archivos en landing para procesar: " + ", ".join(missing),
                         {"missingFiles": missing, "datasets": names})
 
     payload = {"datasets": [{"dataset": n, "engine": DATASETS_BY_NAME[n].silver_engine} for n in names]}
-    result = _sfn.start_execution(stateMachineArn=ds_arn, input=json.dumps(payload))
+    result = _sfn.start_execution(stateMachineArn=_env("DATASET_STATE_MACHINE_ARN"), input=json.dumps(payload))
     return 202, {"executionArn": result["executionArn"], "datasets": names}
+
+
+def run_schedule_now(event):
+    _require_mode("scheduled")
+    busy_datasets, gold_busy, scheduled_busy = _busy()
+    if busy_datasets or gold_busy or scheduled_busy:
+        raise HttpError(409, "Ya hay una ejecución en curso.")
+    result = _sfn.start_execution(stateMachineArn=_env("SCHEDULED_STATE_MACHINE_ARN"), input=json.dumps({"manual": True}))
+    return 202, {"executionArn": result["executionArn"]}
 
 
 def reset_lake(event):
     include_landing = bool(_json_body(event).get("includeLanding", False))
-    if _running(os.environ["DATASET_STATE_MACHINE_ARN"]) or _running(os.environ["GOLD_STATE_MACHINE_ARN"]):
+    busy_datasets, gold_busy, scheduled_busy = _busy()
+    if busy_datasets or gold_busy or scheduled_busy:
         raise HttpError(409, "Hay pipelines en ejecución. Espera a que terminen para reiniciar.")
-    result = _lambda.invoke(FunctionName=os.environ["RESET_FUNCTION_NAME"],
+    q = _queues()
+    if any(q[k]["visible"] + q[k]["inFlight"] + q[k]["delayed"] for k in ("events", "retry")):
+        raise HttpError(409, "Hay eventos en las colas. Espera a que se vacíen para reiniciar.")
+    result = _lambda.invoke(FunctionName=_env("RESET_FUNCTION_NAME"),
                             Payload=json.dumps({"include_landing": include_landing}).encode())
     payload = json.loads(result["Payload"].read())
     if result.get("FunctionError"):
@@ -309,8 +504,15 @@ def run_query(event):
 
 ROUTES = {
     "GET /state": get_state,
+    "GET /events": get_events,
+    "GET /storage": get_storage,
+    "POST /mode": change_mode,
     "POST /upload-url": create_upload_url,
+    "POST /landing/restore": restore_from_archive,
+    "POST /events/simulate": simulate_missing,
+    "POST /dlq/redrive": redrive_dlq,
     "POST /pipeline/start": start_pipeline,
+    "POST /schedule/run": run_schedule_now,
     "POST /reset": reset_lake,
     "POST /query": run_query,
 }

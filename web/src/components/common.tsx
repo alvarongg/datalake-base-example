@@ -10,14 +10,22 @@ import glue from '@/assets/aws/glue.svg';
 import athena from '@/assets/aws/athena.svg';
 import apiGateway from '@/assets/aws/api-gateway.svg';
 import cloudfront from '@/assets/aws/cloudfront.svg';
+import sqs from '@/assets/aws/sqs.svg';
+import eventbridge from '@/assets/aws/eventbridge.svg';
+import cdk from '@/assets/aws/cdk.svg';
+import iam from '@/assets/aws/iam.svg';
+import kms from '@/assets/aws/kms.svg';
+import ssm from '@/assets/aws/ssm.svg';
+import cloudwatch from '@/assets/aws/cloudwatch.svg';
 import { cn } from '@/lib/utils';
 
 /** Iconos OFICIALES de AWS (AWS Architecture Icons, ver assets/aws/NOTICE.md). */
-export const AWS_ICONS = { lambda, cognito, s3, stepFunctions, glue, athena, apiGateway, cloudfront } as const;
+export const AWS_ICONS = { lambda, cognito, s3, stepFunctions, glue, athena, apiGateway, cloudfront, sqs, eventbridge, cdk, iam, kms, ssm, cloudwatch } as const;
 export type AwsService = keyof typeof AWS_ICONS;
 export const AWS_LABELS: Record<AwsService, string> = {
   lambda: 'AWS Lambda', cognito: 'Amazon Cognito', s3: 'Amazon S3', stepFunctions: 'AWS Step Functions',
   glue: 'AWS Glue', athena: 'Amazon Athena', apiGateway: 'Amazon API Gateway', cloudfront: 'Amazon CloudFront',
+  sqs: 'Amazon SQS', eventbridge: 'Amazon EventBridge', cdk: 'AWS CDK', iam: 'AWS IAM', kms: 'AWS KMS', ssm: 'AWS Systems Manager', cloudwatch: 'Amazon CloudWatch',
 };
 
 export function AwsIcon({ name, size = 32, className }: { name: AwsService; size?: number; className?: string }) {
@@ -54,6 +62,8 @@ const STATUS: Record<string, { label: string; color: 'success' | 'warning' | 'da
   TIMED_OUT: { label: 'Timeout', color: 'danger' },
   ABORTED: { label: 'Abortada', color: 'danger' },
   blocked: { label: 'Bloqueado', color: 'danger' },
+  waiting: { label: 'Esperando', color: 'warning' },
+  skipped: { label: 'Sin cambios', color: 'default' },
   STOPPED: { label: 'Detenido', color: 'warning' },
 };
 

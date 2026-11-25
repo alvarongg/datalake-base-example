@@ -3,10 +3,15 @@
 Cómo funciona (simple a propósito):
 * Cada dataset tiene su PROPIO archivo ``progress/<dataset>.json`` en el bucket
   de resultados de Athena, con el estado de sus 3 etapas: bronze, dependencies
-  y silver. Los pipelines de datasets distintos pueden correr a la vez sin
-  pisarse porque cada uno escribe solo su archivo.
-* Gold tiene ``progress/gold.json`` con el estado de cada modelo solicitado.
-* Cada archivo lleva el ``executionId`` de Step Functions que lo escribió.
+  y silver. Pipelines de datasets distintos pueden correr a la vez sin pisarse
+  porque cada uno escribe solo su archivo.
+* Cada modelo Gold tiene ``progress/gold/<modelo>.json`` por el mismo motivo.
+* Cada archivo lleva el ``executionId`` que lo escribió:
+    - ARN de Step Functions en el modo programado;
+    - ``evt:<...>`` en el modo event-driven (lo genera el despachador).
+* Estados de una etapa: pending | running | waiting | succeeded | failed.
+  ``waiting`` solo existe en event-driven: la condición no se cumple todavía y
+  el evento espera 20 s en la DLQ de reintento.
 * Escribir progreso es "best effort": si falla se registra un warning pero el
   pipeline NO se detiene (el seguimiento nunca debe romper el procesamiento).
 * El reset vacía ese bucket, así que también borra el progreso.
@@ -35,33 +40,19 @@ def _put(s3, bucket: str, key: str, body: dict) -> None:
         logger.warning("No se pudo escribir el progreso %s", key, exc_info=True)
 
 
-class _Tracker:
-    """Base: un diccionario JSON que se persiste en cada cambio."""
-
-    key: str
-
-    def __init__(self, bucket: str, client=None):
-        self.bucket = bucket
-        self._s3 = client or boto3.client("s3")
-        self.doc: dict = {}
-
-    def flush(self) -> None:
-        self.doc["updatedAt"] = time.time()
-        _put(self._s3, self.bucket, self.key, self.doc)
-
-
-class DatasetProgress(_Tracker):
+class DatasetProgress:
     """Etapas (bronze → dependencies → silver) de UN dataset en UNA ejecución."""
 
     def __init__(self, bucket: str, dataset: str, execution_id: str | None, engine: str, client=None):
-        super().__init__(bucket, client)
-        self.dataset, self.key = dataset, f"{PREFIX}/{dataset}.json"
-        self.doc = {"dataset": dataset, "executionId": execution_id, "engine": engine,
-                    "stages": {s: {"status": "pending"} for s in DATASET_STAGES}}
+        self.bucket, self.dataset = bucket, dataset
+        self._s3 = client or boto3.client("s3")
+        self.key = f"{PREFIX}/{dataset}.json"
+        self.doc: dict = {"dataset": dataset, "executionId": execution_id, "engine": engine,
+                          "stages": {s: {"status": "pending"} for s in DATASET_STAGES}}
 
     @classmethod
     def load(cls, bucket: str, dataset: str, execution_id: str | None, engine: str, client=None):
-        """Retoma el archivo de esta ejecución (para que cada Lambda agregue su etapa)."""
+        """Retoma el archivo de esta ejecución (para que cada paso agregue su etapa)."""
         self = cls(bucket, dataset, execution_id, engine, client)
         try:
             body = self._s3.get_object(Bucket=bucket, Key=self.key)["Body"].read()
@@ -72,10 +63,22 @@ class DatasetProgress(_Tracker):
             pass
         return self
 
+    def flush(self) -> None:
+        self.doc["updatedAt"] = time.time()
+        _put(self._s3, self.bucket, self.key, self.doc)
+
     def reset(self) -> None:
         """Marca todas las etapas como pendientes (el dataset está 'en cola')."""
         self.doc["queuedAt"] = time.time()
         self.flush()
+
+    def set(self, stage: str, status: str, **info) -> None:
+        """Fija el estado de una etapa sin contexto (lo usa el despachador event-driven)."""
+        self.doc["stages"][stage] = {"status": status, "at": time.time(), **info}
+        self.flush()
+
+    def wait(self, stage: str, attempt: int, max_attempts: int, reason: str, detail: list | None = None) -> None:
+        self.set(stage, "waiting", attempt=attempt, maxAttempts=max_attempts, reason=reason, detail=detail or [])
 
     @contextmanager
     def stage(self, name: str):
@@ -98,31 +101,39 @@ class DatasetProgress(_Tracker):
         return self.doc["stages"].get(stage, {}).get("rows")
 
 
-class GoldProgress(_Tracker):
-    """Estado de los modelos Gold pedidos en UNA ejecución."""
-
-    key = f"{PREFIX}/gold.json"
+class GoldProgress:
+    """Estado de los modelos Gold de UNA ejecución (un archivo por modelo)."""
 
     def __init__(self, bucket: str, execution_id: str | None, names: list[str], client=None):
-        super().__init__(bucket, client)
-        self.doc = {"stage": "gold", "executionId": execution_id,
-                    "tables": [{"name": n, "status": "pending"} for n in names]}
-        self._by_name = {t["name"]: t for t in self.doc["tables"]}
+        self.bucket, self.execution_id = bucket, execution_id
+        self._s3 = client or boto3.client("s3")
+        self.models = {n: {"model": n, "executionId": execution_id, "status": "pending"} for n in names}
+
+    @staticmethod
+    def key(name: str) -> str:
+        return f"{PREFIX}/gold/{name}.json"
+
+    def _flush_one(self, name: str) -> None:
+        self.models[name]["updatedAt"] = time.time()
+        _put(self._s3, self.bucket, self.key(name), self.models[name])
+
+    def flush(self) -> None:
+        for n in self.models:
+            self._flush_one(n)
+
+    def set(self, name: str, status: str, **info) -> None:
+        self.models[name].update(status=status, **info)
+        self._flush_one(name)
 
     def block(self, name: str, error: str, problems: list[dict]) -> None:
-        self._by_name[name].update(status="blocked", error=error[:600], detail=problems)
-        self.flush()
+        self.set(name, "blocked", error=error[:600], detail=problems)
 
     @contextmanager
     def table(self, name: str):
-        t = self._by_name[name]
-        t.update(status="running", startedAt=time.time())
-        self.flush()
+        self.set(name, "running", startedAt=time.time())
         try:
             yield
         except Exception as exc:
-            t.update(status="failed", finishedAt=time.time(), error=str(exc)[:600])
-            self.flush()
+            self.set(name, "failed", finishedAt=time.time(), error=str(exc)[:600])
             raise
-        t.update(status="succeeded", finishedAt=time.time())
-        self.flush()
+        self.set(name, "succeeded", finishedAt=time.time())

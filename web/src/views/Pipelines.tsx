@@ -16,6 +16,7 @@ import { cn, fmtNum } from '@/lib/utils';
 /** Estado agregado de cada ficha según /state. */
 function pipelineState(p: PipelineDef, s?: LakeState): string | undefined {
   if (!s) return undefined;
+  if (p.layer === 'orch') return s.mode === p.id ? (s.running ? 'running' : 'ok') : undefined;
   const ds = p.id === 'silver-glue' ? s.datasets.filter((d) => d.engine === 'glue') : p.id === 'silver-pandas' ? s.datasets.filter((d) => d.engine === 'pandas') : s.datasets;
   if (p.id === 'gold') {
     const st = s.gold.map((g) => g.run?.status);
@@ -44,6 +45,41 @@ function FlowStrip({ p }: { p: PipelineDef }) {
   );
 }
 
+const COMPARE: [string, string, string][] = [
+  ['Qué lo dispara', 'Cada PUT en S3 (y cada paso al terminar)', 'Un horario (EventBridge cada 30 min) o un clic'],
+  ['Latencia', 'Segundos desde que llega el archivo', 'Hasta 30 min (lo que falte para la próxima corrida)'],
+  ['Orden de dependencias', 'Implícito: cada paso espera a sus padres (reintento cada 20 s)', 'Explícito: el plan ordena el lote antes de empezar'],
+  ['Si algo no está listo', 'El evento espera en la DLQ de reintento (máx. 15 × 20 s)', 'El paso falla; la próxima corrida lo vuelve a intentar'],
+  ['Errores', 'Mensaje a la DLQ final con el motivo; redrive desde la web', 'La ejecución queda FAILED con el paso y la causa en el diagrama'],
+  ['Dónde se ve el estado', 'Repartido: feed de decisiones, colas, progreso por tabla', 'Centralizado: una ejecución de Step Functions por lote'],
+  ['Concurrencia', 'Varias tablas en paralelo; locks por tabla con escrituras condicionales de S3', 'Un dataset a la vez dentro del lote (Map con concurrencia 1)'],
+  ['Costo fijo', 'Long polling de SQS: centavos al mes aunque no lleguen archivos', 'Una ejecución cada 30 min: casi nada si no hay trabajo'],
+  ['Cuándo conviene', 'Datos que llegan sueltos y se necesitan rápido', 'Cargas por lotes, cierres diarios, auditoría estricta'],
+];
+
+function Comparison() {
+  const { data } = useLake();
+  const strip = (id: 'event' | 'scheduled') => PIPELINES.find((x) => x.id === id)!;
+  return (
+    <Card>
+      <CardHeader><CardTitle>Event-driven vs programado: dos arquitecturas, el mismo código</CardTitle>
+        <CardDescription>Las capas (Bronze, Silver, Gold) son las mismas funciones. Lo único que cambia es QUIÉN decide cuándo corre cada una. Alterna el modo en Operar y compara.</CardDescription></CardHeader>
+      <CardContent className="space-y-5">
+        <div className="grid gap-4 2xl:grid-cols-2">
+          {(['event', 'scheduled'] as const).map((id) => (
+            <div key={id} className={cn('space-y-2 rounded-xl border p-3', data?.mode === id ? 'border-accent' : 'border-border')}>
+              <p className="flex items-center gap-2 text-sm font-semibold">{strip(id).title}{data?.mode === id && <StatusChip status="succeeded" label="Modo activo" />}</p>
+              <FlowStrip p={strip(id)} />
+            </div>
+          ))}
+        </div>
+        <DataTable head={['', 'Event-driven (SQS + Lambda)', 'Programado (EventBridge + Step Functions)']}
+          rows={COMPARE.map(([a, b, c]) => [<b key="a">{a}</b>, b, c])} />
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Pipelines() {
   const [selected, setSelected] = useState(PIPELINES[0].id);
   const { data } = useLake();
@@ -54,9 +90,11 @@ export default function Pipelines() {
   return (
     <div className="space-y-6">
       <PageHeader title="Pipelines"
-        subtitle="Cada archivo dispara su propio pipeline en Step Functions: Bronze → compuerta de dependencias → Silver (Lambda o Glue) → registro. Gold es un pipeline aparte de modelos SQL. Haz clic en cualquier paso para ver el código que lo implementa.">
+        subtitle="Cada archivo dispara su propio pipeline: Bronze → compuerta de dependencias → Silver (Lambda o Glue) → Gold. Quién decide cuándo corre cada paso depende de la arquitectura: el despachador event-driven (SQS) o Step Functions programado. Haz clic en cualquier paso para ver el código que lo implementa.">
         <CodeButton label="Ver orquestación (Step Functions)" request={{ title: 'Orquestación con Step Functions (CDK)', files: ['infra/stacks/pipeline.py'], highlight: 'per_dataset = ' }} />
       </PageHeader>
+
+      <Comparison />
 
       <div className="grid gap-6 xl:grid-cols-[320px_1fr]">
         <nav className="space-y-2" aria-label="Pipelines">
@@ -86,6 +124,7 @@ export default function Pipelines() {
             <FlowStrip p={p} />
             {p.engineKind === 'glue' && <EngineNote engine="glue" />}
             {p.engineKind === 'lambda' && <EngineNote engine="lambda" compact />}
+            {p.layer === 'orch' && data && <p className="text-sm"><span className="text-muted">Modo activo ahora: </span><b>{data.mode === 'event' ? 'event-driven' : 'programado'}</b> (se cambia en Operar).</p>}
 
             <div className="grid gap-6 2xl:grid-cols-[3fr_2fr]">
               <div>

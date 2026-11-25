@@ -26,6 +26,7 @@ PRICES = {
     "cloudfront_per_10k_https_requests": 0.01,
     "s3_standard_per_gb_month": 0.023,
     "logs_ingest_per_gb": 0.50,
+    "sqs_per_million_requests": 0.40,      # colas estándar (cada 64 KB = 1 request)
 }
 
 HOURS_PER_MONTH = 730
@@ -56,6 +57,11 @@ def apigw_cost(requests: float) -> float:
 def cloudfront_cost(requests: float, bytes_out: float) -> float:
     return (bytes_out / GB * PRICES["cloudfront_per_gb"]
             + requests / 10_000 * PRICES["cloudfront_per_10k_https_requests"])
+
+
+def sqs_cost(requests: float) -> float:
+    """Incluye los "receive vacíos": la Lambda consulta la cola aunque no haya mensajes (long polling)."""
+    return requests / 1e6 * PRICES["sqs_per_million_requests"]
 
 
 def logs_cost(bytes_ingested: float) -> float:

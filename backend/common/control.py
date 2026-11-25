@@ -16,11 +16,15 @@ Conceptos
 
 Estados de un dataset (``dataset_status``)
 ------------------------------------------
-  no_file  : faltan archivos en landing
-  pending  : hay archivos pero nunca se cargó a Bronze
+  no_file  : nunca se cargó y faltan archivos en landing
+  pending  : están todos los archivos pero nunca se cargó a Bronze
   bronze   : Bronze al día, falta Silver
-  stale    : Silver existe pero quedó viejo (archivo nuevo, o una dependencia cambió)
+  stale    : Silver quedó viejo (llegó un archivo nuevo, o una dependencia cambió)
   ok       : al día; puede usarse como dependencia
+
+Después de cargar Bronze, el CSV se MUEVE a ``archive/`` (ver bronze/handler.py).
+Por eso "no hay archivo en landing" no significa "no hay datos": si Bronze ya
+se cargó, la tabla sigue al día con la versión que se archivó.
 
 Regla de oro: un dataset solo se procesa en Silver si TODAS sus dependencias
 están en estado ``ok``. Si no, el pipeline falla con un mensaje claro.
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -46,7 +51,7 @@ from common.settings import DATASET_PREFIX, Settings
 CONTROL_PREFIX = "control"
 
 STATUS_LABELS = {
-    "no_file": "no tiene archivo en landing",
+    "no_file": "nunca se cargó y falta su archivo en landing",
     "pending": "nunca se procesó (no está en Bronze)",
     "bronze": "está en Bronze pero no tiene Silver",
     "stale": "está desactualizada (archivo nuevo o una dependencia cambió)",
@@ -85,12 +90,10 @@ def silver_token(control: dict | None) -> str | None:
 def dataset_status(dataset: Dataset, landing_ver: str | None, controls: dict[str, dict]) -> str:
     ctl = controls.get(dataset.name) or {}
     bronze, silver = ctl.get("bronze"), ctl.get("silver")
-    if landing_ver is None:
-        return "no_file"
     if not bronze:
-        return "pending"
-    if bronze["version"] != landing_ver:  # subieron un archivo distinto
-        return "stale" if silver else "pending"
+        return "pending" if landing_ver else "no_file"
+    if landing_ver and landing_ver != bronze["version"]:  # llegó un archivo distinto, aún sin procesar
+        return "stale"
     if not silver:
         return "bronze"
     if silver["version"] != bronze["version"]:
@@ -186,17 +189,23 @@ class ControlStore:
     def load(self) -> LakeState:
         landing = self.landing_objects()
         versions = {d.name: landing_version(d, landing) for d in DATASETS}
-        controls = {d.name: (self.read(d.name) or {}) for d in DATASETS}
-        gold_entries = (self.read("gold") or {}).get("models", {})
+        models = load_models()
+        # Lecturas en paralelo: son ~20 objetos pequeños y la web consulta el estado seguido.
+        with ThreadPoolExecutor(8) as pool:
+            controls = dict(zip([d.name for d in DATASETS], pool.map(lambda d: self.read(d.name) or {}, DATASETS)))
+            gold_entries = {m.name: e for m, e in zip(models, pool.map(lambda m: self.read_gold(m.name), models)) if e}
         statuses = compute_statuses(versions, controls)
         gold_statuses = {m.name: gold_model_status(m, gold_entries.get(m.name), controls, gold_entries)
-                         for m in load_models()}
+                         for m in models}
         return LakeState(landing, versions, controls, gold_entries, statuses, gold_statuses)
 
     # -- escritura (un único escritor por archivo: el pipeline de ese dataset) --
-    def record_bronze(self, dataset: str, version: str, rows: int) -> None:
+    def record_bronze(self, dataset: str, version: str, rows: int, files: dict[str, str] | None = None,
+                      archived: list[str] | None = None) -> None:
+        """``files``: archivo -> ETag consumido (sirve para reconocer eventos duplicados)."""
         ctl = self.read(dataset) or {"dataset": dataset}
-        ctl["bronze"] = {"version": version, "at": now_iso(), "rows": rows}
+        ctl["bronze"] = {"version": version, "at": now_iso(), "rows": rows,
+                         "files": files or {}, "archived": archived or []}
         self.write(dataset, ctl)
 
     def record_silver(self, dataset: str, built_from: dict[str, str | None], rows: int | None) -> None:
@@ -207,7 +216,9 @@ class ControlStore:
                          "token": f"{bronze['version']}@{at}", "built_from": built_from}
         self.write(dataset, ctl)
 
+    # Un archivo por modelo Gold: dos modelos se pueden construir a la vez sin pisarse.
+    def read_gold(self, model: str) -> dict | None:
+        return self.read(f"gold/{model}")
+
     def record_gold(self, model: str, built_from: dict[str, str | None]) -> None:
-        body = self.read("gold") or {"models": {}}
-        body["models"][model] = {"at": now_iso(), "built_from": built_from}
-        self.write("gold", body)
+        self.write(f"gold/{model}", {"model": model, "at": now_iso(), "built_from": built_from})
