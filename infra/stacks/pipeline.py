@@ -37,6 +37,7 @@ GLUE_SCRIPT = str(Path(BACKEND_DIR) / "glue" / "silver_facts.py")
 # Capa gestionada de AWS con pandas + awswrangler ya instalados (evita empaquetar
 # dependencias pesadas). Versiones: https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
 PANDAS_LAYER_VERSION = 32
+GLUE_JOB_NAME = "datalake-demo-silver-facts"
 
 GLUE_ACTIONS = [
     "glue:GetDatabase", "glue:GetDatabases", "glue:GetTable", "glue:GetTables",
@@ -82,6 +83,8 @@ class PipelineStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, lake: DataLakeStack, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         self.lake = lake
+        # Registro (id -> (función, memoria MB)) que usan Costos y Observabilidad para conocer cada componente.
+        self.functions: dict[str, tuple[_lambda.Function, int]] = {}
 
         # Variables de entorno comunes: lo único que el código necesita saber del entorno.
         self.env_vars = {
@@ -100,11 +103,11 @@ class PipelineStack(Stack):
             f"arn:aws:lambda:{self.region}:336392948345:layer:AWSSDKPandas-Python312:{PANDAS_LAYER_VERSION}",
         )
 
-        plan_fn = self._function("Plan", "lambdas.plan.handler.lambda_handler", Duration.seconds(30), layer=False)
+        plan_fn = self._function("Plan", "lambdas.plan.handler.lambda_handler", Duration.seconds(30), layer=False, memory=256)
         bronze_fn = self._function("Bronze", "lambdas.bronze.handler.lambda_handler", Duration.minutes(5))
-        deps_fn = self._function("Dependencies", "lambdas.dependencies.handler.lambda_handler", Duration.seconds(30), layer=False)
+        deps_fn = self._function("Dependencies", "lambdas.dependencies.handler.lambda_handler", Duration.seconds(30), layer=False, memory=256)
         silver_fn = self._function("SilverDimensions", "lambdas.silver_dimensions.handler.lambda_handler", Duration.minutes(5))
-        finalize_fn = self._function("Finalize", "lambdas.finalize.handler.lambda_handler", Duration.seconds(30), layer=False)
+        finalize_fn = self._function("Finalize", "lambdas.finalize.handler.lambda_handler", Duration.seconds(30), layer=False, memory=256)
         gold_fn = self._function("Gold", "lambdas.gold.handler.lambda_handler", Duration.minutes(10))
         self.reset_fn = self._function("Reset", "lambdas.reset.handler.lambda_handler", Duration.minutes(2), layer=True)
 
@@ -154,7 +157,7 @@ class PipelineStack(Stack):
 
         glue_job = glue.CfnJob(
             self, "SilverFactsJob",
-            name="datalake-demo-silver-facts",
+            name=GLUE_JOB_NAME,
             role=glue_role.role_arn,
             glue_version="4.0",  # Spark 3.3 / Python 3
             worker_type="G.1X",
@@ -232,16 +235,16 @@ class PipelineStack(Stack):
             result_path=sfn.JsonPath.DISCARD,
         ).item_processor(per_dataset)
 
+        self.dataset_logs = logs.LogGroup(self, "DatasetPipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
+                                          removal_policy=RemovalPolicy.DESTROY)
+        self.gold_logs = logs.LogGroup(self, "GoldPipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
+                                       removal_policy=RemovalPolicy.DESTROY)
         self.dataset_machine = sfn.StateMachine(
             self, "DatasetPipeline",
             state_machine_name="datalake-demo-datasets",
             definition_body=sfn.DefinitionBody.from_chainable(plan_step.next(for_each)),
             timeout=Duration.hours(1),
-            logs=sfn.LogOptions(
-                destination=logs.LogGroup(self, "DatasetPipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
-                                          removal_policy=RemovalPolicy.DESTROY),
-                level=sfn.LogLevel.ERROR,
-            ),
+            logs=sfn.LogOptions(destination=self.dataset_logs, level=sfn.LogLevel.ALL),
         )
 
         # ---- Step Functions: pipeline GOLD -------------------------------
@@ -254,26 +257,24 @@ class PipelineStack(Stack):
             state_machine_name="datalake-demo-gold",
             definition_body=sfn.DefinitionBody.from_chainable(gold_step),
             timeout=Duration.hours(1),
-            logs=sfn.LogOptions(
-                destination=logs.LogGroup(self, "GoldPipelineLogs", retention=logs.RetentionDays.ONE_WEEK,
-                                          removal_policy=RemovalPolicy.DESTROY),
-                level=sfn.LogLevel.ERROR,
-            ),
+            logs=sfn.LogOptions(destination=self.gold_logs, level=sfn.LogLevel.ALL),
         )
 
         CfnOutput(self, "DatasetStateMachineArn", value=self.dataset_machine.state_machine_arn)
         CfnOutput(self, "GoldStateMachineArn", value=self.gold_machine.state_machine_arn)
         CfnOutput(self, "ResetFunctionName", value=self.reset_fn.function_name)
 
-    def _function(self, name: str, handler: str, timeout: Duration, layer: bool = True) -> _lambda.Function:
-        return _lambda.Function(
+    def _function(self, name: str, handler: str, timeout: Duration, layer: bool = True, memory: int = 1024) -> _lambda.Function:
+        fn = _lambda.Function(
             self, f"{name}Function",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler=handler,
             code=backend_code(),
             layers=[self.pandas_layer] if layer else [],
-            memory_size=1024,
+            memory_size=memory,
             timeout=timeout,
             environment=self.env_vars,
             log_retention=logs.RetentionDays.ONE_WEEK,
         )
+        self.functions[name] = (fn, memory)
+        return fn

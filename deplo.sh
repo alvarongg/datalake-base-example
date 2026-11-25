@@ -69,6 +69,9 @@ check_prereqs() {
   for bin in aws node npm python3; do
     command -v "$bin" >/dev/null || fail "Falta '$bin' en el PATH"
   done
+  # La web (React + Vite 7) necesita Node 20.19 o superior; CDK también corre sobre Node.
+  node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>20||(a===20&&b>=19)?0:1)' \
+    || fail "Se necesita Node >= 20.19 (tienes $(node -v)). Instala Node 22 LTS y vuelve a intentar."
   # Si las credenciales no sirven, fallamos ya, antes de construir nada.
   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)" \
     || fail "El perfil '$AWS_PROFILE' no tiene credenciales válidas (prueba 'aws sso login' o 'aws configure')"
@@ -129,8 +132,9 @@ build_web() {
   "apiUrl": "$(output "$S_API" ApiUrl)"
 }
 EOF
-  log "7/9 Compilando la web (npm + vite)"
-  (cd web && npm install --no-audit --no-fund && npm run build)
+  log "7/9 Compilando la web (React + Vite: tipos con tsc y bundle optimizado)"
+  # npm ci instala exactamente lo que dice package-lock.json (builds reproducibles).
+  (cd web && npm ci --no-audit --no-fund && npm run build)
 }
 
 # ---------------------------------------------------------------------------

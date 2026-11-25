@@ -45,13 +45,29 @@ Navegador ─► CloudFront ─► S3 (web estática)
 
 ## La web
 
-Cinco pestañas:
+SPA en **React 19 + TypeScript + Vite**, pensada para monitores 16:9 (usa todo el ancho). Librerías:
 
-- **Resumen**: diagramas con los [iconos oficiales de AWS](https://aws.amazon.com/architecture/icons/) (`web/src/assets/aws/`): cómo se conecta la app y el flujo medallion, que se ilumina mientras corren los pipelines.
-- **Operar**: carga de CSV y **mapa gráfico de pipelines**: un nodo por tabla con sus dependencias como flechas y el estado en vivo de cada etapa (Bronze → Dependencias → Silver). Cada nodo tiene "Solo este" y "Con dependencias". Debajo, los modelos Gold con su propio grafo. Incluye el reinicio.
-- **Pipelines**: una ficha por etapa (Bronze, Dependencias, Silver pandas, Silver Glue, Gold) con servicios, pasos, reglas, código clave y estado actual.
-- **Dashboard**: ocho paneles, cada uno una consulta Athena sobre Gold con su propio gráfico (barras, líneas, dona, KPI, tabla; el tipo se puede cambiar) y una consulta libre con gráfico.
-- **Modelo de datos**: diagrama entidad-relación original (8 tablas de Kaggle, copo de nieve) y el optimizado (estrella + agregados), con la lista de optimizaciones y un comparador que ejecuta la misma consulta en Athena sobre tres modelos y muestra datos leídos y tiempo.
+| Librería | Para qué |
+|---|---|
+| [React Flow](https://reactflow.dev/) (`@xyflow/react`) + dagre | Todos los diagramas: arquitectura, flujo medallion, ER arrastrables y mapa de pipelines en vivo |
+| [HeroUI v3](https://heroui.com/) | Tema oscuro, botones, chips de estado, spinners |
+| [shadcn/ui](https://ui.shadcn.com/) | Card, Tabs, Sheet y Table en `web/src/components/ui/` (Radix), adaptados a los tokens de color de HeroUI |
+| [D3](https://d3js.org/) | Gráficos del tablero y de costos (d3 calcula escalas y formas; React dibuja el SVG) |
+| TanStack Query | Llamadas a la API con caché y refresco en vivo |
+| prism-react-renderer | Visor de código con resaltado |
+| Motion | Microanimaciones (respeta "reducir movimiento") |
+
+Siete pestañas, en el orden en que se enseña a construir el data lake:
+
+1. **Resumen**: flujo medallion y arquitectura con los [iconos oficiales de AWS](https://aws.amazon.com/architecture/icons/) (`web/src/assets/aws/`). El flujo se ilumina con el estado real.
+2. **Modelo de datos**: ER original (8 tablas de Kaggle, copo de nieve) y optimizado (estrella + agregados). Las tablas **se arrastran y sueltan** (la disposición se guarda en el navegador), las relaciones se anclan a la fila de cada columna y eligen el lado más corto, y al hacer clic en una tabla se resaltan sus relaciones. Incluye "Ordenar automáticamente", el linaje de los agregados y un comparador de velocidad en Athena.
+3. **Pipelines**: una ficha por etapa. **Cada paso abre el código exacto** que lo implementa (el código del repo se embebe en la web al compilar). Explica por qué se usa Lambda (dataset chico) y cuándo pasar a Glue con Spark (más de ~1 millón de registros).
+4. **Operar**: carga de CSV y mapa React Flow con un nodo por tabla: etapas en vivo, "Solo este" / "Con dependencias" y acceso al código. Debajo, el grafo de modelos Gold. Incluye el reinicio.
+5. **Consultar**: tablero de comando (8 paneles, cada uno una consulta Athena sobre Gold con su gráfico D3) y consulta libre con gráfico.
+6. **Costos**: estimación casi en tiempo real (se recalcula cada minuto) por servicio: Lambda, Glue, Athena, Step Functions, S3, API Gateway, CloudFront y CloudWatch Logs. Lee el uso real (CloudWatch, historial de Glue/Athena/Step Functions, tamaño de S3) y aplica precios de lista (`backend/common/pricing.py`). Es una estimación: la factura real llega a Cost Explorer con hasta 24 h de retraso.
+7. **Observabilidad**: logs de CloudWatch de cada componente (todas las Lambdas, los dos flujos de Step Functions y el job de Glue) con errores y warnings resaltados, búsqueda, modo en vivo, y las últimas ejecuciones con la causa del fallo.
+
+Requiere Node >= 20.19 (Vite 7). Desarrollo local: `cd web && npm ci && npm run dev` (necesita `web/public/config.json`, que genera `deplo.sh`).
 
 ## Un pipeline por archivo, con dependencias
 
@@ -98,10 +114,10 @@ El botón **Reiniciar** de la web (o `./deplo.sh reset`) invoca la Lambda `reset
 deplo.sh            despliegue completo
 infra/              CDK (Python): stacks web, auth, datalake, pipeline, api
 backend/common/     contrato de datasets, configuración, transformaciones puras, validador SQL
-backend/lambdas/    api · bronze · silver_dimensions · gold · reset
+backend/lambdas/    api · plan · bronze · dependencies · silver_dimensions · finalize · gold · reset · costs · observability
 backend/glue/       job Spark de Silver (hechos)
 backend/sql/gold/   modelos Gold en SQL (se ejecutan en orden numérico)
-web/                SPA (Vite + JS) con login Cognito
+web/                SPA React + TS (React Flow, HeroUI, shadcn/ui, D3) con login Cognito
 sample-data/        CSV de Adventure Works
 tests/              pytest: transformaciones, SQL guard, modelos Gold, infraestructura
 ```
@@ -109,7 +125,7 @@ tests/              pytest: transformaciones, SQL guard, modelos Gold, infraestr
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q    # 70 tests, sin credenciales AWS
+.venv/bin/python -m pytest -q    # 83 tests, sin credenciales AWS
 ```
 
 Cubren las funciones de limpieza con los CSV reales, el validador de SQL, el orden de dependencias de los modelos Gold y propiedades de seguridad de la infraestructura (buckets privados, sin auto-registro en Cognito, todas las rutas con JWT). Los jobs de Glue y las Lambdas se validan de punta a punta con `./deplo.sh run`.
@@ -122,7 +138,8 @@ Cubren las funciones de limpieza con los CSV reales, el validador de SQL, el ord
 - **Buckets privados**, cifrados, solo TLS; CloudFront con OAC y cabeceras de seguridad.
 - **Idempotencia**: `overwrite` en Bronze/Silver, purga previa en el job de Glue, `DROP` + CTAS en Gold.
 - **Sin nombres de recursos en el código**: todo llega por variables de entorno desde CDK.
-- **Control de costos**: Glue con 2 workers y timeout de 15 min, API con throttling, logs a 1 semana.
+- **Control de costos**: Glue con 2 workers y timeout de 15 min, API con throttling, logs a 1 semana, y la pestaña Costos para ver el gasto por servicio.
+- **Costos y Observabilidad de solo lectura**: cada una en su propia Lambda con permisos de lectura limitados (métricas, logs de sus grupos, historiales).
 
 ## Notas
 

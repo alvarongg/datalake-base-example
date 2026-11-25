@@ -1,7 +1,7 @@
 // Textos didácticos y consultas de ejemplo. Se mantienen separados de la lógica
 // para que un ingeniero pueda editar la explicación sin tocar código.
 
-export const LAYERS = [
+export const LAYERS: { id: 'landing' | 'bronze' | 'silver' | 'gold'; title: string; tag: string; text: string }[] = [
   {
     id: 'landing',
     title: 'Landing',
@@ -28,7 +28,7 @@ export const LAYERS = [
   },
 ];
 
-export const EXAMPLE_QUERIES = [
+export const EXAMPLE_QUERIES: { title: string; sql: string }[] = [
   {
     title: 'Ingresos y margen por categoría',
     sql: `SELECT category_name,
@@ -81,7 +81,7 @@ ORDER BY _source_file`,
 /* ----------------------------------------------------------------------
  * Modelo de datos: por qué el modelo Gold es más rápido que el original.
  * -------------------------------------------------------------------- */
-export const OPTIMIZATIONS = [
+export const OPTIMIZATIONS: [string, string, string][] = [
   ['De copo de nieve a estrella', 'Para obtener la categoría de una venta el modelo original encadena 3 joins (Products → Subcategories → Categories). dim_product viene desnormalizada: 1 join.', 'Menos joins'],
   ['Medidas precalculadas', 'fact_sales guarda revenue, cost y profit ya multiplicados. Las consultas suman una columna en vez de calcular cantidad × precio en cada ejecución.', 'Menos cómputo'],
   ['Particionado por año', 'fact_sales está particionada por order_year. Con WHERE order_year = 2016 Athena solo lee esa carpeta (partition pruning).', 'Menos bytes leídos'],
@@ -92,7 +92,7 @@ export const OPTIMIZATIONS = [
 ];
 
 // Mismo resultado (ingresos por categoría en 2016) con tres modelos distintos.
-export const BENCHMARKS = [
+export const BENCHMARKS: { id: string; label: string; joins: number; sql: string }[] = [
   {
     id: 'original', label: 'Modelo original normalizado (Silver)', joins: 3,
     sql: `SELECT c.category_name, ROUND(SUM(s.order_quantity * p.product_price), 0) AS revenue
@@ -128,7 +128,8 @@ ORDER BY revenue DESC`,
  * type: kpi | bar | hbar | line | donut | table   ·   wide: ocupa dos columnas
  * Todas leen la capa Gold (el modelo pensado para consumo).
  * -------------------------------------------------------------------- */
-export const DASHBOARD_PANELS = [
+export type ChartType = 'kpi' | 'bar' | 'hbar' | 'line' | 'donut' | 'table';
+export const DASHBOARD_PANELS: { id: string; title: string; type: ChartType; wide?: boolean; sql: string }[] = [
   {
     id: 'kpi', title: 'Resumen del negocio', type: 'kpi', wide: true,
     sql: `SELECT ROUND(SUM(revenue), 0) AS revenue,

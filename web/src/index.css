@@ -1,0 +1,44 @@
+@import "tailwindcss";
+@import "@heroui/styles";
+@import "@xyflow/react/dist/style.css";
+
+/* Tailwind debe escanear también los componentes de HeroUI. */
+@source "../node_modules/@heroui/react";
+
+/* Colores propios de las capas del medallion (se usan en diagramas y chips). */
+@theme {
+  --color-landing: oklch(0.75 0.13 230);
+  --color-bronze: oklch(0.62 0.13 55);
+  --color-silver: oklch(0.78 0.02 260);
+  --color-gold: oklch(0.82 0.16 85);
+  --color-glue: oklch(0.72 0.17 50);
+  --color-pandas: oklch(0.78 0.12 200);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html, body, #root { height: 100%; }
+
+/* React Flow con los colores del tema. */
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-node-border-radius: 12px;
+  --xy-edge-stroke: var(--muted);
+  --xy-edge-stroke-width: 1.5;
+  --xy-controls-button-background-color: var(--surface-secondary);
+  --xy-controls-button-color: var(--foreground);
+  --xy-controls-button-border-color: var(--border);
+  --xy-minimap-background-color: var(--surface-secondary);
+  --xy-attribution-background-color: transparent;
+}
+.react-flow__node { font-family: inherit; }
+.react-flow__handle { width: 7px; height: 7px; background: var(--muted); border: none; }
+.react-flow__edge.animated path { stroke-dasharray: 6 4; }
+
+/* Respeta "reducir movimiento" del sistema operativo. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  .react-flow__edge.animated path { animation: none; }
+}
+
+@keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 60%, transparent); } 100% { box-shadow: 0 0 0 10px transparent; } }
+.pulse-ring { animation: pulse-ring 1.4s ease-out infinite; }

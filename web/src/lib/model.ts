@@ -1,14 +1,20 @@
 // Definición de los dos modelos de datos que dibuja er.js.
 // k: 'pk' clave primaria · 'fk' clave foránea · 'part' columna de partición.
 
-const c = (n, k = '') => ({ n, k });
+export type ColKind = '' | 'pk' | 'fk' | 'part';
+export interface Column { n: string; k: ColKind }
+export interface Entity { id: string; title: string; x: number; y: number; w?: number; agg?: boolean; cols: Column[] }
+export interface Relation { from: string; fromCol: string; to: string; toCol: string }
+export interface ErModel { width: number; height: number; entities: Entity[]; relations: Relation[]; notes?: { x: number; y: number; text: string }[] }
+
+const c = (n: string, k: ColKind = ''): Column => ({ n, k });
 
 /* ------------------------------------------------------------------
  * MODELO ORIGINAL: las 8 tablas tal como vienen en los CSV de Kaggle.
  * Es un esquema normalizado tipo "copo de nieve" (snowflake): para saber la
  * categoría de una venta hay que encadenar Sales → Products → Subcategories → Categories.
  * ------------------------------------------------------------------ */
-export const ORIGINAL = {
+export const ORIGINAL: ErModel = {
   width: 970, height: 510,
   entities: [
     { id: 'cat', title: 'Product_Categories', x: 20, y: 10, cols: [c('ProductCategoryKey', 'pk'), c('CategoryName')] },
@@ -44,7 +50,7 @@ export const ORIGINAL = {
  * Una tabla de hechos al centro y dimensiones desnormalizadas alrededor:
  * cualquier consulta necesita como máximo 1 join por dimensión.
  * ------------------------------------------------------------------ */
-export const OPTIMIZED = {
+export const OPTIMIZED: ErModel = {
   width: 970, height: 720,
   entities: [
     { id: 'dprod', title: 'dim_product', x: 20, y: 10, cols: [

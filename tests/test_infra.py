@@ -50,6 +50,6 @@ def test_state_machine_exists(stacks):
 def test_every_api_route_requires_jwt(stacks):
     t = Template.from_stack(stacks["api"])
     routes = t.find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 5
+    assert len(routes) == 8
     for r in routes.values():
         assert r["Properties"]["AuthorizationType"] == "JWT"
